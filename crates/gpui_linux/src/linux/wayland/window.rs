@@ -14,7 +14,7 @@ use wayland_backend::client::ObjectId;
 use wayland_client::WEnum;
 use wayland_client::{
     Proxy,
-    protocol::{wl_output, wl_surface},
+    protocol::{wl_output, wl_subsurface, wl_surface},
 };
 use wayland_protocols::wp::viewporter::client::wp_viewport;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
@@ -548,6 +548,21 @@ impl WaylandWindowStatePtr {
 
     pub fn surface(&self) -> wl_surface::WlSurface {
         self.state.borrow().surface.clone()
+    }
+
+    pub fn create_subsurface(
+        &self,
+    ) -> Option<(wl_surface::WlSurface, wl_subsurface::WlSubsurface)> {
+        let state = self.state.borrow();
+        let subcompositor = state.globals.subcompositor.as_ref()?;
+        let child_surface = state
+            .globals
+            .compositor
+            .create_surface(&state.globals.qh, ());
+        let subsurface =
+            subcompositor.get_subsurface(&child_surface, &state.surface, &state.globals.qh, ());
+        subsurface.set_desync();
+        Some((child_surface, subsurface))
     }
 
     pub fn toplevel(&self) -> Option<xdg_toplevel::XdgToplevel> {
@@ -1468,6 +1483,50 @@ impl PlatformWindow for WaylandWindow {
             state.client_inset = Some(inset);
             update_window(state);
         }
+    }
+
+    fn wayland_surface_info(&self) -> Option<gpui::WaylandSurfaceInfo> {
+        let state = self.0.state.borrow();
+        let surface_ptr = state.surface.id().as_ptr() as *mut std::ffi::c_void;
+        let display_ptr = state.surface.backend().upgrade()?.display_ptr() as *mut std::ffi::c_void;
+        Some(gpui::WaylandSurfaceInfo {
+            parent_surface_ptr: surface_ptr,
+            display_ptr,
+        })
+    }
+
+    fn attach_child_wayland_surface(
+        &self,
+        child_surface_ptr: *mut std::ffi::c_void,
+    ) -> Option<gpui::WaylandSubsurfaceHandle> {
+        use wayland_backend::client::ObjectId;
+        use wayland_client::Proxy;
+
+        let state = self.0.state.borrow();
+        let subcompositor = state.globals.subcompositor.as_ref()?;
+        let backend = state.surface.backend().upgrade()?;
+        let connection = wayland_client::Connection::from_backend(backend.clone());
+
+        let child_id = unsafe {
+            ObjectId::from_ptr(
+                wl_surface::WlSurface::interface(),
+                child_surface_ptr as *mut _,
+            )
+            .ok()?
+        };
+        let child_surface = wl_surface::WlSurface::from_id(&connection, child_id).ok()?;
+
+        let subsurface =
+            subcompositor.get_subsurface(&child_surface, &state.surface, &state.globals.qh, ());
+        subsurface.set_desync();
+
+        drop(state);
+        drop(connection);
+        drop(backend);
+
+        Some(gpui::WaylandSubsurfaceHandle::new(move |x, y| {
+            subsurface.set_position(x, y);
+        }))
     }
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {

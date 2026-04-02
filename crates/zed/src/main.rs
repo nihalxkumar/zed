@@ -100,6 +100,9 @@ fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
         .collect::<Vec<_>>().join("\n\n");
 
     eprintln!("{message}: {error_details}");
+    #[cfg(all(target_os = "linux", feature = "web-view"))]
+    web_view::initialize_gtk();
+
     Application::with_platform(gpui_platform::current_platform(false))
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
@@ -322,6 +325,9 @@ fn main() {
 
     #[cfg(windows)]
     check_for_conpty_dll();
+
+    #[cfg(all(target_os = "linux", feature = "web-view"))]
+    web_view::initialize_gtk();
 
     let app =
         Application::with_platform(gpui_platform::current_platform(false)).with_assets(Assets);
@@ -694,6 +700,8 @@ fn main() {
 
         editor::init(cx);
         image_viewer::init(cx);
+        #[cfg(feature = "web-view")]
+        web_view::init(cx);
         repl::notebook::init(cx);
         diagnostics::init(cx);
 

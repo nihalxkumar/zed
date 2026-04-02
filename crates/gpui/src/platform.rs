@@ -583,6 +583,37 @@ impl Tiling {
     }
 }
 
+#[cfg(target_os = "linux")]
+/// Raw Wayland handles for the parent GPUI window surface and its display.
+pub struct WaylandSurfaceInfo {
+    /// Raw `wl_surface *` for the GPUI parent window surface.
+    pub parent_surface_ptr: *mut std::ffi::c_void,
+    /// Raw `wl_display *` for the Wayland connection backing the parent surface.
+    pub display_ptr: *mut std::ffi::c_void,
+}
+
+/// Opaque handle to a Wayland subsurface managed by the platform layer.
+/// Dropping this destroys the subsurface relationship.
+#[cfg(target_os = "linux")]
+pub struct WaylandSubsurfaceHandle {
+    set_position_fn: Box<dyn Fn(i32, i32)>,
+}
+
+#[cfg(target_os = "linux")]
+impl WaylandSubsurfaceHandle {
+    /// Create a new handle wrapping a position-setting callback.
+    pub fn new(set_position_fn: impl Fn(i32, i32) + 'static) -> Self {
+        Self {
+            set_position_fn: Box::new(set_position_fn),
+        }
+    }
+
+    /// Set the position of the subsurface relative to the parent.
+    pub fn set_position(&self, x: i32, y: i32) {
+        (self.set_position_fn)(x, y);
+    }
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 #[expect(missing_docs)]
 pub struct RequestFrameOptions {
@@ -685,6 +716,19 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         WindowControls::default()
     }
     fn set_client_inset(&self, _inset: Pixels) {}
+    #[cfg(target_os = "linux")]
+    fn wayland_surface_info(&self) -> Option<WaylandSurfaceInfo> {
+        None
+    }
+    /// Attach an externally-owned `wl_surface` (e.g. from GTK/GDK) as a
+    /// subsurface of this window. Returns a handle to control positioning.
+    #[cfg(target_os = "linux")]
+    fn attach_child_wayland_surface(
+        &self,
+        _child_surface_ptr: *mut std::ffi::c_void,
+    ) -> Option<WaylandSubsurfaceHandle> {
+        None
+    }
     fn gpu_specs(&self) -> Option<GpuSpecs>;
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);

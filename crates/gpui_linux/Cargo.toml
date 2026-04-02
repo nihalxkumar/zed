@@ -54,6 +54,7 @@ screen-capture = [
 anyhow.workspace = true
 bytemuck = "1"
 collections.workspace = true
+gdk = "0.18"
 futures.workspace = true
 gpui.workspace = true
 gpui_wgpu = { workspace = true, optional = true, features = ["font-kit"] }
@@ -71,6 +72,7 @@ strum.workspace = true
 url.workspace = true
 util.workspace = true
 uuid.workspace = true
+gtk = "0.18"
 
 # Always used
 oo7 = { version = "0.6", default-features = false, features = [

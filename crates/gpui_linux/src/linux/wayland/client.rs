@@ -28,6 +28,7 @@ use wayland_client::protocol::wl_data_offer::WlDataOffer;
 use wayland_client::protocol::wl_pointer::AxisSource;
 use wayland_client::protocol::{
     wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source, wl_output, wl_region,
+    wl_subcompositor, wl_subsurface,
 };
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
@@ -103,6 +104,14 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
 
+mod gdk_wayland_ffi {
+    use std::ffi::c_void;
+
+    unsafe extern "C" {
+        pub fn gdk_wayland_display_get_wl_display(display: *mut c_void) -> *mut c_void;
+    }
+}
+
 /// Used to convert evdev scancode to xkb scancode
 const MIN_KEYCODE: u32 = 8;
 
@@ -129,6 +138,7 @@ pub struct Globals {
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
     pub dialog: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
+    pub subcompositor: Option<wl_subcompositor::WlSubcompositor>,
     pub executor: ForegroundExecutor,
 }
 
@@ -170,6 +180,7 @@ impl Globals {
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
             dialog: globals.bind(&qh, dialog_v..=dialog_v, ()).ok(),
+            subcompositor: globals.bind(&qh, 1..=1, ()).ok(),
             executor,
             qh,
         }
@@ -463,7 +474,8 @@ fn wl_output_version(version: u32) -> u32 {
 
 impl WaylandClient {
     pub(crate) fn new() -> Self {
-        let conn = Connection::connect_to_env().unwrap();
+        let conn = existing_gdk_wayland_connection()
+            .unwrap_or_else(|| Connection::connect_to_env().unwrap());
 
         let (globals, event_queue) = registry_queue_init::<WaylandClientStatePtr>(&conn).unwrap();
         let qh = event_queue.handle();
@@ -1012,6 +1024,30 @@ fn detect_compositor_gpu() -> Option<CompositorGpuHint> {
     crate::linux::compositor_gpu_hint_from_dev_t(state.device?)
 }
 
+fn existing_gdk_wayland_connection() -> Option<Connection> {
+    use gdk::glib::prelude::ObjectType;
+    use gdk::prelude::DisplayExtManual;
+
+    if !gtk::is_initialized() {
+        return None;
+    }
+
+    let display = gdk::Display::default()?;
+    if !display.backend().is_wayland() {
+        return None;
+    }
+
+    let display_ptr =
+        unsafe { gdk_wayland_ffi::gdk_wayland_display_get_wl_display(display.as_ptr() as *mut _) };
+    if display_ptr.is_null() {
+        return None;
+    }
+
+    let backend =
+        unsafe { wayland_backend::sys::client::Backend::from_foreign_display(display_ptr.cast()) };
+    Some(Connection::from_backend(backend))
+}
+
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStatePtr {
     fn event(
         this: &mut Self,
@@ -1078,6 +1114,8 @@ delegate_noop!(WaylandClientStatePtr: ignore wl_shm::WlShm);
 delegate_noop!(WaylandClientStatePtr: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(WaylandClientStatePtr: ignore wl_buffer::WlBuffer);
 delegate_noop!(WaylandClientStatePtr: ignore wl_region::WlRegion);
+delegate_noop!(WaylandClientStatePtr: ignore wl_subcompositor::WlSubcompositor);
+delegate_noop!(WaylandClientStatePtr: ignore wl_subsurface::WlSubsurface);
 delegate_noop!(WaylandClientStatePtr: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
 delegate_noop!(WaylandClientStatePtr: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
 delegate_noop!(WaylandClientStatePtr: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);

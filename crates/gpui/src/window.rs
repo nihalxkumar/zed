@@ -1712,6 +1712,22 @@ impl Window {
         self.platform_window.inner_window_bounds()
     }
 
+    /// Returns Wayland surface info for embedding native content as subsurfaces.
+    #[cfg(target_os = "linux")]
+    pub fn wayland_surface_info(&self) -> Option<crate::WaylandSurfaceInfo> {
+        self.platform_window.wayland_surface_info()
+    }
+
+    /// Attach an externally-owned `wl_surface` as a subsurface of this window.
+    #[cfg(target_os = "linux")]
+    pub fn attach_child_wayland_surface(
+        &self,
+        child_surface_ptr: *mut std::ffi::c_void,
+    ) -> Option<crate::WaylandSubsurfaceHandle> {
+        self.platform_window
+            .attach_child_wayland_surface(child_surface_ptr)
+    }
+
     /// Dispatch the given action on the currently focused element.
     pub fn dispatch_action(&mut self, action: Box<dyn Action>, cx: &mut App) {
         let focus_id = self.focused(cx).map(|handle| handle.id);
