@@ -2,6 +2,7 @@ use super::edit_file_tool::EditFileTool;
 use super::restore_file_from_disk_tool::RestoreFileFromDiskTool;
 use super::save_file_tool::SaveFileTool;
 use super::tool_edit_parser::{ToolEditEvent, ToolEditParser};
+use crate::ToolInputPayload;
 use crate::{
     AgentTool, Thread, ToolCallEventStream, ToolInput,
     edit_agent::{
@@ -11,8 +12,8 @@ use crate::{
 };
 use acp_thread::Diff;
 use action_log::ActionLog;
-use agent_client_protocol::{self as acp, ToolCallLocation, ToolCallUpdateFields};
-use anyhow::{Context as _, Result};
+use agent_client_protocol::schema::{self as acp, ToolCallLocation, ToolCallUpdateFields};
+use anyhow::Result;
 use collections::HashSet;
 use futures::FutureExt as _;
 use gpui::{App, AppContext, AsyncApp, Entity, Task, WeakEntity};
@@ -22,7 +23,10 @@ use language_model::LanguageModelToolResultContent;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
 use project::{AgentLocation, Project, ProjectPath};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{DeserializeOwned, Error as _},
+};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -73,13 +77,14 @@ pub struct StreamingEditFileToolInput {
     /// <example>
     /// `frontend/db.js`
     /// </example>
-    pub path: String,
+    pub path: PathBuf,
 
     /// The mode of operation on the file. Possible values:
     /// - 'write': Replace the entire contents of the file. If the file doesn't exist, it will be created. Requires 'content' field.
     /// - 'edit': Make granular edits to an existing file. Requires 'edits' field.
     ///
     /// When a file already exists or you just created it, prefer editing it as opposed to recreating it from scratch.
+    #[serde(deserialize_with = "deserialize_maybe_stringified")]
     pub mode: StreamingEditFileMode,
 
     /// The complete content for the new file (required for 'write' mode).
@@ -89,11 +94,15 @@ pub struct StreamingEditFileToolInput {
 
     /// List of edit operations to apply sequentially (required for 'edit' mode).
     /// Each edit finds `old_text` in the file and replaces it with `new_text`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_maybe_stringified"
+    )]
     pub edits: Option<Vec<Edit>>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamingEditFileMode {
     /// Overwrite the file with new content (replacing any existing content).
@@ -104,35 +113,61 @@ pub enum StreamingEditFileMode {
 }
 
 /// A single edit operation that replaces old text with new text
+/// Properly escape all text fields as valid JSON strings.
+/// Remember to escape special characters like newlines (`\n`) and quotes (`"`) in JSON strings.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Edit {
     /// The exact text to find in the file. This will be matched using fuzzy matching
     /// to handle minor differences in whitespace or formatting.
+    ///
+    /// Be minimal with replacements:
+    /// - For unique lines, include only those lines
+    /// - For non-unique lines, include enough context to identify them
     pub old_text: String,
     /// The text to replace it with
     pub new_text: String,
 }
 
-#[derive(Default, Debug, Deserialize)]
+#[derive(Clone, Default, Debug, Deserialize)]
 struct StreamingEditFileToolPartialInput {
     #[serde(default)]
     display_description: Option<String>,
     #[serde(default)]
     path: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_maybe_stringified")]
     mode: Option<StreamingEditFileMode>,
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_maybe_stringified")]
     edits: Option<Vec<PartialEdit>>,
 }
 
-#[derive(Default, Debug, Deserialize)]
+#[derive(Clone, Default, Debug, Deserialize)]
 pub struct PartialEdit {
     #[serde(default)]
     pub old_text: Option<String>,
     #[serde(default)]
     pub new_text: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ValueOrJsonString<T> {
+    Value(T),
+    String(String),
+}
+
+fn deserialize_maybe_stringified<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+where
+    T: DeserializeOwned,
+    D: Deserializer<'de>,
+{
+    match ValueOrJsonString::<T>::deserialize(deserializer)? {
+        ValueOrJsonString::Value(value) => Ok(value),
+        ValueOrJsonString::String(string) => serde_json::from_str::<T>(&string).map_err(|error| {
+            D::Error::custom(format!("failed to parse stringified value: {error}"))
+        }),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -148,6 +183,10 @@ pub enum StreamingEditFileToolOutput {
     },
     Error {
         error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_path: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        diff: String,
     },
 }
 
@@ -155,6 +194,8 @@ impl StreamingEditFileToolOutput {
     pub fn error(error: impl Into<String>) -> Self {
         Self::Error {
             error: error.into(),
+            input_path: None,
+            diff: String::new(),
         }
     }
 }
@@ -175,7 +216,24 @@ impl std::fmt::Display for StreamingEditFileToolOutput {
                     )
                 }
             }
-            StreamingEditFileToolOutput::Error { error } => write!(f, "{error}"),
+            StreamingEditFileToolOutput::Error {
+                error,
+                diff,
+                input_path,
+            } => {
+                write!(f, "{error}\n")?;
+                if let Some(input_path) = input_path
+                    && !diff.is_empty()
+                {
+                    write!(
+                        f,
+                        "Edited {}:\n\n```diff\n{diff}\n```",
+                        input_path.display()
+                    )
+                } else {
+                    write!(f, "No edits were made.")
+                }
+            }
         }
     }
 }
@@ -187,20 +245,31 @@ impl From<StreamingEditFileToolOutput> for LanguageModelToolResultContent {
 }
 
 pub struct StreamingEditFileTool {
-    thread: WeakEntity<Thread>,
-    language_registry: Arc<LanguageRegistry>,
     project: Entity<Project>,
+    thread: WeakEntity<Thread>,
+    action_log: Entity<ActionLog>,
+    language_registry: Arc<LanguageRegistry>,
+}
+
+enum EditSessionResult {
+    Completed(EditSession),
+    Failed {
+        error: String,
+        session: Option<EditSession>,
+    },
 }
 
 impl StreamingEditFileTool {
     pub fn new(
         project: Entity<Project>,
         thread: WeakEntity<Thread>,
+        action_log: Entity<ActionLog>,
         language_registry: Arc<LanguageRegistry>,
     ) -> Self {
         Self {
             project,
             thread,
+            action_log,
             language_registry,
         }
     }
@@ -231,6 +300,158 @@ impl StreamingEditFileTool {
             self.project.update(cx, |project, cx| {
                 project.set_agent_location(Some(AgentLocation { buffer, position }), cx);
             });
+        }
+    }
+
+    async fn ensure_buffer_saved(&self, buffer: &Entity<Buffer>, cx: &mut AsyncApp) {
+        let format_on_save_enabled = buffer.read_with(cx, |buffer, cx| {
+            let settings = language_settings::LanguageSettings::for_buffer(buffer, cx);
+            settings.format_on_save != FormatOnSave::Off
+        });
+
+        if format_on_save_enabled {
+            self.project
+                .update(cx, |project, cx| {
+                    project.format(
+                        HashSet::from_iter([buffer.clone()]),
+                        LspFormatTarget::Buffers,
+                        false,
+                        FormatTrigger::Save,
+                        cx,
+                    )
+                })
+                .await
+                .log_err();
+        }
+
+        self.project
+            .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+            .await
+            .log_err();
+
+        self.action_log.update(cx, |log, cx| {
+            log.buffer_edited(buffer.clone(), cx);
+        });
+    }
+
+    async fn process_streaming_edits(
+        &self,
+        input: &mut ToolInput<StreamingEditFileToolInput>,
+        event_stream: &ToolCallEventStream,
+        cx: &mut AsyncApp,
+    ) -> EditSessionResult {
+        let mut session: Option<EditSession> = None;
+        let mut last_partial: Option<StreamingEditFileToolPartialInput> = None;
+
+        loop {
+            futures::select! {
+                payload = input.next().fuse() => {
+                    match payload {
+                        Ok(payload) => match payload {
+                            ToolInputPayload::Partial(partial) => {
+                                if let Ok(parsed) = serde_json::from_value::<StreamingEditFileToolPartialInput>(partial) {
+                                    let path_complete = parsed.path.is_some()
+                                        && parsed.path.as_ref() == last_partial.as_ref().and_then(|partial| partial.path.as_ref());
+
+                                    last_partial = Some(parsed.clone());
+
+                                    if session.is_none()
+                                        && path_complete
+                                        && let StreamingEditFileToolPartialInput {
+                                            path: Some(path),
+                                            display_description: Some(display_description),
+                                            mode: Some(mode),
+                                            ..
+                                        } = &parsed
+                                    {
+                                        match EditSession::new(
+                                            PathBuf::from(path),
+                                            display_description,
+                                            *mode,
+                                            self,
+                                            event_stream,
+                                            cx,
+                                        )
+                                        .await
+                                        {
+                                            Ok(created_session) => session = Some(created_session),
+                                            Err(error) => {
+                                                log::error!("Failed to create edit session: {}", error);
+                                                return EditSessionResult::Failed {
+                                                    error,
+                                                    session: None,
+                                                };
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(current_session) = &mut session
+                                        && let Err(error) = current_session.process(parsed, self, event_stream, cx)
+                                    {
+                                        log::error!("Failed to process edit: {}", error);
+                                        return EditSessionResult::Failed { error, session };
+                                    }
+                                }
+                            }
+                            ToolInputPayload::Full(full_input) => {
+                                let mut session = if let Some(session) = session {
+                                    session
+                                } else {
+                                    match EditSession::new(
+                                        full_input.path.clone(),
+                                        &full_input.display_description,
+                                        full_input.mode,
+                                        self,
+                                        event_stream,
+                                        cx,
+                                    )
+                                    .await
+                                    {
+                                        Ok(created_session) => created_session,
+                                        Err(error) => {
+                                            log::error!("Failed to create edit session: {}", error);
+                                            return EditSessionResult::Failed {
+                                                error,
+                                                session: None,
+                                            };
+                                        }
+                                    }
+                                };
+
+                                return match session.finalize(full_input, self, event_stream, cx).await {
+                                    Ok(()) => EditSessionResult::Completed(session),
+                                    Err(error) => {
+                                        log::error!("Failed to finalize edit: {}", error);
+                                        EditSessionResult::Failed {
+                                            error,
+                                            session: Some(session),
+                                        }
+                                    }
+                                };
+                            }
+                            ToolInputPayload::InvalidJson { error_message } => {
+                                log::error!("Received invalid JSON: {error_message}");
+                                return EditSessionResult::Failed {
+                                    error: error_message,
+                                    session,
+                                };
+                            }
+                        },
+                        Err(error) => {
+                            return EditSessionResult::Failed {
+                                error: format!("Failed to receive tool input: {error}"),
+                                session,
+                            };
+                        }
+                    }
+                }
+                _ = event_stream.cancelled_by_user().fuse() => {
+                    return EditSessionResult::Failed {
+                        error: "Edit cancelled by user".to_string(),
+                        session,
+                    };
+                }
+            }
         }
     }
 }
@@ -264,11 +485,11 @@ impl AgentTool for StreamingEditFileTool {
                         .read(cx)
                         .short_full_path_for_project_path(&project_path, cx)
                 })
-                .unwrap_or(input.path)
+                .unwrap_or(input.path.to_string_lossy().into_owned())
                 .into(),
             Err(raw_input) => {
-                if let Some(input) =
-                    serde_json::from_value::<StreamingEditFileToolPartialInput>(raw_input).ok()
+                if let Ok(input) =
+                    serde_json::from_value::<StreamingEditFileToolPartialInput>(raw_input)
                 {
                     let path = input.path.unwrap_or_default();
                     let path = path.trim();
@@ -305,58 +526,41 @@ impl AgentTool for StreamingEditFileTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |cx: &mut AsyncApp| {
-            let mut state: Option<EditSession> = None;
-            loop {
-                futures::select! {
-                    partial = input.recv_partial().fuse() => {
-                        let Some(partial_value) = partial else { break };
-                        if let Ok(parsed) = serde_json::from_value::<StreamingEditFileToolPartialInput>(partial_value) {
-                            if state.is_none() && let Some(path_str) = &parsed.path
-                                && let Some(display_description) = &parsed.display_description
-                                && let Some(mode) = parsed.mode.clone() {
-                                    state = Some(
-                                        EditSession::new(
-                                            path_str,
-                                            display_description,
-                                            mode,
-                                            &self,
-                                            &event_stream,
-                                            cx,
-                                        )
-                                        .await?,
-                                    );
-                            }
-
-                            if let Some(state) = &mut state {
-                                state.process(parsed, &self, &event_stream, cx)?;
-                            }
-                        }
-                    }
-                    _ = event_stream.cancelled_by_user().fuse() => {
-                        return Err(StreamingEditFileToolOutput::error("Edit cancelled by user"));
-                    }
+            match self
+                .process_streaming_edits(&mut input, &event_stream, cx)
+                .await
+            {
+                EditSessionResult::Completed(session) => {
+                    self.ensure_buffer_saved(&session.buffer, cx).await;
+                    let (new_text, diff) = session.compute_new_text_and_diff(cx).await;
+                    Ok(StreamingEditFileToolOutput::Success {
+                        old_text: session.old_text.clone(),
+                        new_text,
+                        input_path: session.input_path,
+                        diff,
+                    })
                 }
+                EditSessionResult::Failed {
+                    error,
+                    session: Some(session),
+                } => {
+                    self.ensure_buffer_saved(&session.buffer, cx).await;
+                    let (_new_text, diff) = session.compute_new_text_and_diff(cx).await;
+                    Err(StreamingEditFileToolOutput::Error {
+                        error,
+                        input_path: Some(session.input_path),
+                        diff,
+                    })
+                }
+                EditSessionResult::Failed {
+                    error,
+                    session: None,
+                } => Err(StreamingEditFileToolOutput::Error {
+                    error,
+                    input_path: None,
+                    diff: String::new(),
+                }),
             }
-            let full_input =
-                input
-                    .recv()
-                    .await
-                    .map_err(|e| StreamingEditFileToolOutput::error(format!("Failed to receive tool input: {e}")))?;
-
-            let mut state = if let Some(state) = state {
-                state
-            } else {
-                EditSession::new(
-                    &full_input.path,
-                    &full_input.display_description,
-                    full_input.mode.clone(),
-                    &self,
-                    &event_stream,
-                    cx,
-                )
-                .await?
-            };
-            state.finalize(full_input, &self, &event_stream, cx).await
         })
     }
 
@@ -392,17 +596,19 @@ impl AgentTool for StreamingEditFileTool {
 
 pub struct EditSession {
     abs_path: PathBuf,
+    input_path: PathBuf,
     buffer: Entity<Buffer>,
     old_text: Arc<String>,
     diff: Entity<Diff>,
     mode: StreamingEditFileMode,
     parser: ToolEditParser,
     pipeline: EditPipeline,
+    file_changed_since_last_read: bool,
     _finalize_diff_guard: Deferred<Box<dyn FnOnce()>>,
 }
 
 struct EditPipeline {
-    edits: Vec<EditPipelineEntry>,
+    current_edit: Option<EditPipelineEntry>,
     content_written: bool,
 }
 
@@ -416,57 +622,43 @@ enum EditPipelineEntry {
         reindenter: Reindenter,
         original_snapshot: text::BufferSnapshot,
     },
-    Done,
 }
 
 impl EditPipeline {
     fn new() -> Self {
         Self {
-            edits: Vec::new(),
+            current_edit: None,
             content_written: false,
         }
     }
 
-    fn ensure_resolving_old_text(
-        &mut self,
-        edit_index: usize,
-        buffer: &Entity<Buffer>,
-        cx: &mut AsyncApp,
-    ) {
-        while self.edits.len() <= edit_index {
+    fn ensure_resolving_old_text(&mut self, buffer: &Entity<Buffer>, cx: &mut AsyncApp) {
+        if self.current_edit.is_none() {
             let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.text_snapshot());
-            self.edits.push(EditPipelineEntry::ResolvingOldText {
+            self.current_edit = Some(EditPipelineEntry::ResolvingOldText {
                 matcher: StreamingFuzzyMatcher::new(snapshot),
             });
         }
     }
 }
 
-/// Compute the `LineIndent` of the first line in a set of query lines.
-fn query_first_line_indent(query_lines: &[String]) -> text::LineIndent {
-    let first_line = query_lines.first().map(|s| s.as_str()).unwrap_or("");
-    text::LineIndent::from_iter(first_line.chars())
-}
-
 impl EditSession {
     async fn new(
-        path_str: &str,
+        path: PathBuf,
         display_description: &str,
         mode: StreamingEditFileMode,
         tool: &StreamingEditFileTool,
         event_stream: &ToolCallEventStream,
         cx: &mut AsyncApp,
-    ) -> Result<Self, StreamingEditFileToolOutput> {
-        let path = PathBuf::from(path_str);
-        let project_path = cx
-            .update(|cx| resolve_path(mode.clone(), &path, &tool.project, cx))
-            .map_err(|e| StreamingEditFileToolOutput::error(e.to_string()))?;
+    ) -> Result<Self, String> {
+        let project_path = cx.update(|cx| resolve_path(mode, &path, &tool.project, cx))?;
 
         let Some(abs_path) = cx.update(|cx| tool.project.read(cx).absolute_path(&project_path, cx))
         else {
-            return Err(StreamingEditFileToolOutput::error(format!(
-                "Worktree at '{path_str}' does not exist"
-            )));
+            return Err(format!(
+                "Worktree at '{}' does not exist",
+                path.to_string_lossy()
+            ));
         };
 
         event_stream.update_fields(
@@ -475,15 +667,15 @@ impl EditSession {
 
         cx.update(|cx| tool.authorize(&path, &display_description, event_stream, cx))
             .await
-            .map_err(|e| StreamingEditFileToolOutput::error(e.to_string()))?;
+            .map_err(|e| e.to_string())?;
 
         let buffer = tool
             .project
             .update(cx, |project, cx| project.open_buffer(project_path, cx))
             .await
-            .map_err(|e| StreamingEditFileToolOutput::error(e.to_string()))?;
+            .map_err(|e| e.to_string())?;
 
-        ensure_buffer_saved(&buffer, &abs_path, tool, cx)?;
+        let file_changed_since_last_read = ensure_buffer_saved(&buffer, &abs_path, tool, cx)?;
 
         let diff = cx.new(|cx| Diff::new(buffer.clone(), cx));
         event_stream.update_diff(diff.clone());
@@ -495,13 +687,10 @@ impl EditSession {
             }
         }) as Box<dyn FnOnce()>);
 
-        tool.thread
-            .update(cx, |thread, cx| {
-                thread
-                    .action_log()
-                    .update(cx, |log, cx| log.buffer_read(buffer.clone(), cx))
-            })
-            .ok();
+        tool.action_log.update(cx, |log, cx| match mode {
+            StreamingEditFileMode::Write => log.buffer_created(buffer.clone(), cx),
+            StreamingEditFileMode::Edit => log.buffer_read(buffer.clone(), cx),
+        });
 
         let old_snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
         let old_text = cx
@@ -513,12 +702,14 @@ impl EditSession {
 
         Ok(Self {
             abs_path,
+            input_path: path,
             buffer,
             old_text,
             diff,
             mode,
             parser: ToolEditParser::default(),
             pipeline: EditPipeline::new(),
+            file_changed_since_last_read,
             _finalize_diff_guard: finalize_diff_guard,
         })
     }
@@ -529,131 +720,44 @@ impl EditSession {
         tool: &StreamingEditFileTool,
         event_stream: &ToolCallEventStream,
         cx: &mut AsyncApp,
-    ) -> Result<StreamingEditFileToolOutput, StreamingEditFileToolOutput> {
-        let Self {
-            buffer,
-            old_text,
-            diff,
-            abs_path,
-            parser,
-            pipeline,
-            ..
-        } = self;
-
-        let action_log = tool
-            .thread
-            .read_with(cx, |thread, _cx| thread.action_log().clone())
-            .map_err(|e| StreamingEditFileToolOutput::error(e.to_string()))?;
-
+    ) -> Result<(), String> {
         match input.mode {
             StreamingEditFileMode::Write => {
-                action_log.update(cx, |log, cx| {
-                    log.buffer_created(buffer.clone(), cx);
-                });
-                let content = input.content.ok_or_else(|| {
-                    StreamingEditFileToolOutput::error("'content' field is required for write mode")
-                })?;
+                let content = input
+                    .content
+                    .ok_or_else(|| "'content' field is required for write mode".to_string())?;
 
-                let events = parser.finalize_content(&content);
-                Self::process_events(
-                    &events,
-                    buffer,
-                    diff,
-                    pipeline,
-                    abs_path,
-                    tool,
-                    event_stream,
-                    cx,
-                )?;
+                let events = self.parser.finalize_content(&content);
+                self.process_events(&events, tool, event_stream, cx)?;
             }
             StreamingEditFileMode::Edit => {
-                let edits = input.edits.ok_or_else(|| {
-                    StreamingEditFileToolOutput::error("'edits' field is required for edit mode")
-                })?;
+                let edits = input
+                    .edits
+                    .ok_or_else(|| "'edits' field is required for edit mode".to_string())?;
+                let events = self.parser.finalize_edits(&edits);
+                self.process_events(&events, tool, event_stream, cx)?;
 
-                let final_edits = edits
-                    .into_iter()
-                    .map(|e| Edit {
-                        old_text: e.old_text,
-                        new_text: e.new_text,
-                    })
-                    .collect::<Vec<_>>();
-                let events = parser.finalize_edits(&final_edits);
-                Self::process_events(
-                    &events,
-                    buffer,
-                    diff,
-                    pipeline,
-                    abs_path,
-                    tool,
-                    event_stream,
-                    cx,
-                )?;
-            }
-        }
-
-        let format_on_save_enabled = buffer.read_with(cx, |buffer, cx| {
-            let settings = language_settings::language_settings(
-                buffer.language().map(|l| l.name()),
-                buffer.file(),
-                cx,
-            );
-            settings.format_on_save != FormatOnSave::Off
-        });
-
-        if format_on_save_enabled {
-            action_log.update(cx, |log, cx| {
-                log.buffer_edited(buffer.clone(), cx);
-            });
-
-            let format_task = tool.project.update(cx, |project, cx| {
-                project.format(
-                    HashSet::from_iter([buffer.clone()]),
-                    LspFormatTarget::Buffers,
-                    false,
-                    FormatTrigger::Save,
-                    cx,
-                )
-            });
-            futures::select! {
-                result = format_task.fuse() => { result.log_err(); },
-                _ = event_stream.cancelled_by_user().fuse() => {
-                    return Err(StreamingEditFileToolOutput::error("Edit cancelled by user"));
+                if log::log_enabled!(log::Level::Debug) {
+                    log::debug!("Got edits:");
+                    for edit in &edits {
+                        log::debug!(
+                            "  old_text: '{}', new_text: '{}'",
+                            edit.old_text.replace('\n', "\\n"),
+                            edit.new_text.replace('\n', "\\n")
+                        );
+                    }
                 }
-            };
-        }
-
-        let save_task = tool
-            .project
-            .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx));
-        futures::select! {
-            result = save_task.fuse() => { result.map_err(|e| StreamingEditFileToolOutput::error(e.to_string()))?; },
-            _ = event_stream.cancelled_by_user().fuse() => {
-                return Err(StreamingEditFileToolOutput::error("Edit cancelled by user"));
             }
-        };
-
-        action_log.update(cx, |log, cx| {
-            log.buffer_edited(buffer.clone(), cx);
-        });
-
-        if let Some(new_mtime) = buffer.read_with(cx, |buffer, _| {
-            buffer.file().and_then(|file| file.disk_state().mtime())
-        }) {
-            tool.thread
-                .update(cx, |thread, _| {
-                    thread
-                        .file_read_times
-                        .insert(abs_path.to_path_buf(), new_mtime);
-                })
-                .map_err(|e| StreamingEditFileToolOutput::error(e.to_string()))?;
         }
+        Ok(())
+    }
 
-        let new_snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+    async fn compute_new_text_and_diff(&self, cx: &mut AsyncApp) -> (String, String) {
+        let new_snapshot = self.buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
         let (new_text, unified_diff) = cx
             .background_spawn({
                 let new_snapshot = new_snapshot.clone();
-                let old_text = old_text.clone();
+                let old_text = self.old_text.clone();
                 async move {
                     let new_text = new_snapshot.text();
                     let diff = language::unified_diff(&old_text, &new_text);
@@ -661,14 +765,7 @@ impl EditSession {
                 }
             })
             .await;
-
-        let output = StreamingEditFileToolOutput::Success {
-            input_path: PathBuf::from(input.path),
-            new_text,
-            old_text: old_text.clone(),
-            diff: unified_diff,
-        };
-        Ok(output)
+        (new_text, unified_diff)
     }
 
     fn process(
@@ -677,36 +774,18 @@ impl EditSession {
         tool: &StreamingEditFileTool,
         event_stream: &ToolCallEventStream,
         cx: &mut AsyncApp,
-    ) -> Result<(), StreamingEditFileToolOutput> {
+    ) -> Result<(), String> {
         match &self.mode {
             StreamingEditFileMode::Write => {
                 if let Some(content) = &partial.content {
                     let events = self.parser.push_content(content);
-                    Self::process_events(
-                        &events,
-                        &self.buffer,
-                        &self.diff,
-                        &mut self.pipeline,
-                        &self.abs_path,
-                        tool,
-                        event_stream,
-                        cx,
-                    )?;
+                    self.process_events(&events, tool, event_stream, cx)?;
                 }
             }
             StreamingEditFileMode::Edit => {
                 if let Some(edits) = partial.edits {
                     let events = self.parser.push_edits(&edits);
-                    Self::process_events(
-                        &events,
-                        &self.buffer,
-                        &self.diff,
-                        &mut self.pipeline,
-                        &self.abs_path,
-                        tool,
-                        event_stream,
-                        cx,
-                    )?;
+                    self.process_events(&events, tool, event_stream, cx)?;
                 }
             }
         }
@@ -714,70 +793,61 @@ impl EditSession {
     }
 
     fn process_events(
+        &mut self,
         events: &[ToolEditEvent],
-        buffer: &Entity<Buffer>,
-        diff: &Entity<Diff>,
-        pipeline: &mut EditPipeline,
-        abs_path: &PathBuf,
         tool: &StreamingEditFileTool,
         event_stream: &ToolCallEventStream,
         cx: &mut AsyncApp,
-    ) -> Result<(), StreamingEditFileToolOutput> {
-        let action_log = tool
-            .thread
-            .read_with(cx, |thread, _cx| thread.action_log().clone())
-            .ok();
-
+    ) -> Result<(), String> {
         for event in events {
             match event {
                 ToolEditEvent::ContentChunk { chunk } => {
-                    let (buffer_id, insert_at) = buffer.read_with(cx, |buffer, _cx| {
-                        let insert_at = if !pipeline.content_written && buffer.len() > 0 {
-                            0..buffer.len()
-                        } else {
-                            let len = buffer.len();
-                            len..len
-                        };
-                        (buffer.remote_id(), insert_at)
-                    });
+                    let (buffer_id, buffer_len) = self
+                        .buffer
+                        .read_with(cx, |buffer, _cx| (buffer.remote_id(), buffer.len()));
+                    let edit_range = if self.pipeline.content_written {
+                        buffer_len..buffer_len
+                    } else {
+                        0..buffer_len
+                    };
+
                     agent_edit_buffer(
-                        buffer,
-                        [(insert_at, chunk.as_str())],
-                        action_log.as_ref(),
+                        &self.buffer,
+                        [(edit_range, chunk.as_str())],
+                        &tool.action_log,
                         cx,
                     );
                     cx.update(|cx| {
                         tool.set_agent_location(
-                            buffer.downgrade(),
+                            self.buffer.downgrade(),
                             text::Anchor::max_for_buffer(buffer_id),
                             cx,
                         );
                     });
-                    pipeline.content_written = true;
+                    self.pipeline.content_written = true;
                 }
 
                 ToolEditEvent::OldTextChunk {
-                    edit_index,
-                    chunk,
-                    done: false,
+                    chunk, done: false, ..
                 } => {
-                    pipeline.ensure_resolving_old_text(*edit_index, buffer, cx);
+                    log::debug!("old_text_chunk: done=false, chunk='{}'", chunk);
+                    self.pipeline.ensure_resolving_old_text(&self.buffer, cx);
 
-                    if let EditPipelineEntry::ResolvingOldText { matcher } =
-                        &mut pipeline.edits[*edit_index]
+                    if let Some(EditPipelineEntry::ResolvingOldText { matcher }) =
+                        &mut self.pipeline.current_edit
+                        && !chunk.is_empty()
                     {
-                        if !chunk.is_empty() {
-                            if let Some(match_range) = matcher.push(chunk, None) {
-                                let anchor_range = buffer.read_with(cx, |buffer, _cx| {
-                                    buffer.anchor_range_between(match_range.clone())
-                                });
-                                diff.update(cx, |diff, cx| diff.reveal_range(anchor_range, cx));
+                        if let Some(match_range) = matcher.push(chunk, None) {
+                            let anchor_range = self.buffer.read_with(cx, |buffer, _cx| {
+                                buffer.anchor_range_outside(match_range.clone())
+                            });
+                            self.diff
+                                .update(cx, |diff, cx| diff.reveal_range(anchor_range, cx));
 
-                                cx.update(|cx| {
-                                    let position = buffer.read(cx).anchor_before(match_range.end);
-                                    tool.set_agent_location(buffer.downgrade(), position, cx);
-                                });
-                            }
+                            cx.update(|cx| {
+                                let position = self.buffer.read(cx).anchor_before(match_range.end);
+                                tool.set_agent_location(self.buffer.downgrade(), position, cx);
+                            });
                         }
                     }
                 }
@@ -787,10 +857,12 @@ impl EditSession {
                     chunk,
                     done: true,
                 } => {
-                    pipeline.ensure_resolving_old_text(*edit_index, buffer, cx);
+                    log::debug!("old_text_chunk: done=true, chunk='{}'", chunk);
 
-                    let EditPipelineEntry::ResolvingOldText { matcher } =
-                        &mut pipeline.edits[*edit_index]
+                    self.pipeline.ensure_resolving_old_text(&self.buffer, cx);
+
+                    let Some(EditPipelineEntry::ResolvingOldText { matcher }) =
+                        &mut self.pipeline.current_edit
                     else {
                         continue;
                     };
@@ -798,87 +870,79 @@ impl EditSession {
                     if !chunk.is_empty() {
                         matcher.push(chunk, None);
                     }
-                    let matches = matcher.finish();
+                    let range = extract_match(
+                        matcher.finish(),
+                        &self.buffer,
+                        edit_index,
+                        self.file_changed_since_last_read,
+                        cx,
+                    )?;
 
-                    if matches.is_empty() {
-                        return Err(StreamingEditFileToolOutput::error(format!(
-                            "Could not find matching text for edit at index {}. \
-                                 The old_text did not match any content in the file. \
-                                 Please read the file again to get the current content.",
-                            edit_index,
-                        )));
-                    }
-                    if matches.len() > 1 {
-                        let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
-                        let lines = matches
-                            .iter()
-                            .map(|r| (snapshot.offset_to_point(r.start).row + 1).to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        return Err(StreamingEditFileToolOutput::error(format!(
-                            "Edit {} matched multiple locations in the file at lines: {}. \
-                                 Please provide more context in old_text to uniquely \
-                                 identify the location.",
-                            edit_index, lines
-                        )));
-                    }
+                    let anchor_range = self
+                        .buffer
+                        .read_with(cx, |buffer, _cx| buffer.anchor_range_outside(range.clone()));
+                    self.diff
+                        .update(cx, |diff, cx| diff.reveal_range(anchor_range, cx));
 
-                    let range = matches.into_iter().next().expect("checked len above");
-
-                    let anchor_range = buffer
-                        .read_with(cx, |buffer, _cx| buffer.anchor_range_between(range.clone()));
-                    diff.update(cx, |diff, cx| diff.reveal_range(anchor_range, cx));
-
-                    let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+                    let snapshot = self.buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
 
                     let line = snapshot.offset_to_point(range.start).row;
                     event_stream.update_fields(
-                        ToolCallUpdateFields::new()
-                            .locations(vec![ToolCallLocation::new(abs_path).line(Some(line))]),
+                        ToolCallUpdateFields::new().locations(vec![
+                            ToolCallLocation::new(&self.abs_path).line(Some(line)),
+                        ]),
                     );
 
-                    let EditPipelineEntry::ResolvingOldText { matcher } =
-                        &pipeline.edits[*edit_index]
-                    else {
-                        continue;
-                    };
-                    let buffer_indent =
-                        snapshot.line_indent_for_row(snapshot.offset_to_point(range.start).row);
-                    let query_indent = query_first_line_indent(matcher.query_lines());
+                    let buffer_indent = snapshot.line_indent_for_row(line);
+                    let query_indent = text::LineIndent::from_iter(
+                        matcher
+                            .query_lines()
+                            .first()
+                            .map(|s| s.as_str())
+                            .unwrap_or("")
+                            .chars(),
+                    );
                     let indent_delta = compute_indent_delta(buffer_indent, query_indent);
 
                     let old_text_in_buffer =
                         snapshot.text_for_range(range.clone()).collect::<String>();
 
-                    let text_snapshot = buffer.read_with(cx, |buffer, _cx| buffer.text_snapshot());
-                    pipeline.edits[*edit_index] = EditPipelineEntry::StreamingNewText {
+                    log::debug!(
+                        "edit[{}] old_text matched at {}..{}: {:?}",
+                        edit_index,
+                        range.start,
+                        range.end,
+                        old_text_in_buffer,
+                    );
+
+                    let text_snapshot = self
+                        .buffer
+                        .read_with(cx, |buffer, _cx| buffer.text_snapshot());
+                    self.pipeline.current_edit = Some(EditPipelineEntry::StreamingNewText {
                         streaming_diff: StreamingDiff::new(old_text_in_buffer),
                         edit_cursor: range.start,
                         reindenter: Reindenter::new(indent_delta),
                         original_snapshot: text_snapshot,
-                    };
+                    });
 
                     cx.update(|cx| {
-                        let position = buffer.read(cx).anchor_before(range.end);
-                        tool.set_agent_location(buffer.downgrade(), position, cx);
+                        let position = self.buffer.read(cx).anchor_before(range.end);
+                        tool.set_agent_location(self.buffer.downgrade(), position, cx);
                     });
                 }
 
                 ToolEditEvent::NewTextChunk {
-                    edit_index,
-                    chunk,
-                    done: false,
+                    chunk, done: false, ..
                 } => {
-                    if *edit_index >= pipeline.edits.len() {
-                        continue;
-                    }
-                    let EditPipelineEntry::StreamingNewText {
+                    log::debug!("new_text_chunk: done=false, chunk='{}'", chunk);
+
+                    let Some(EditPipelineEntry::StreamingNewText {
                         streaming_diff,
                         edit_cursor,
                         reindenter,
                         original_snapshot,
                         ..
-                    } = &mut pipeline.edits[*edit_index]
+                    }) = &mut self.pipeline.current_edit
                     else {
                         continue;
                     };
@@ -889,39 +953,32 @@ impl EditSession {
                     }
 
                     let char_ops = streaming_diff.push_new(&reindented);
-                    Self::apply_char_operations(
+                    apply_char_operations(
                         &char_ops,
-                        buffer,
+                        &self.buffer,
                         original_snapshot,
                         edit_cursor,
-                        action_log.as_ref(),
+                        &tool.action_log,
                         cx,
                     );
 
                     let position = original_snapshot.anchor_before(*edit_cursor);
                     cx.update(|cx| {
-                        tool.set_agent_location(buffer.downgrade(), position, cx);
+                        tool.set_agent_location(self.buffer.downgrade(), position, cx);
                     });
                 }
 
                 ToolEditEvent::NewTextChunk {
-                    edit_index,
-                    chunk,
-                    done: true,
+                    chunk, done: true, ..
                 } => {
-                    if *edit_index >= pipeline.edits.len() {
-                        continue;
-                    }
+                    log::debug!("new_text_chunk: done=true, chunk='{}'", chunk);
 
-                    let EditPipelineEntry::StreamingNewText {
+                    let Some(EditPipelineEntry::StreamingNewText {
                         mut streaming_diff,
                         mut edit_cursor,
                         mut reindenter,
                         original_snapshot,
-                    } = std::mem::replace(
-                        &mut pipeline.edits[*edit_index],
-                        EditPipelineEntry::Done,
-                    )
+                    }) = self.pipeline.current_edit.take()
                     else {
                         continue;
                     };
@@ -930,62 +987,102 @@ impl EditSession {
                     let mut final_text = reindenter.push(chunk);
                     final_text.push_str(&reindenter.finish());
 
+                    log::debug!("new_text_chunk: done=true, final_text='{}'", final_text);
+
                     if !final_text.is_empty() {
                         let char_ops = streaming_diff.push_new(&final_text);
-                        Self::apply_char_operations(
+                        apply_char_operations(
                             &char_ops,
-                            buffer,
+                            &self.buffer,
                             &original_snapshot,
                             &mut edit_cursor,
-                            action_log.as_ref(),
+                            &tool.action_log,
                             cx,
                         );
                     }
 
                     let remaining_ops = streaming_diff.finish();
-                    Self::apply_char_operations(
+                    apply_char_operations(
                         &remaining_ops,
-                        buffer,
+                        &self.buffer,
                         &original_snapshot,
                         &mut edit_cursor,
-                        action_log.as_ref(),
+                        &tool.action_log,
                         cx,
                     );
 
                     let position = original_snapshot.anchor_before(edit_cursor);
                     cx.update(|cx| {
-                        tool.set_agent_location(buffer.downgrade(), position, cx);
+                        tool.set_agent_location(self.buffer.downgrade(), position, cx);
                     });
                 }
             }
         }
         Ok(())
     }
+}
 
-    fn apply_char_operations(
-        ops: &[CharOperation],
-        buffer: &Entity<Buffer>,
-        snapshot: &text::BufferSnapshot,
-        edit_cursor: &mut usize,
-        action_log: Option<&Entity<ActionLog>>,
-        cx: &mut AsyncApp,
-    ) {
-        for op in ops {
-            match op {
-                CharOperation::Insert { text } => {
-                    let anchor = snapshot.anchor_after(*edit_cursor);
-                    agent_edit_buffer(&buffer, [(anchor..anchor, text.as_str())], action_log, cx);
-                }
-                CharOperation::Delete { bytes } => {
-                    let delete_end = *edit_cursor + bytes;
-                    let anchor_range = snapshot.anchor_range_around(*edit_cursor..delete_end);
-                    agent_edit_buffer(&buffer, [(anchor_range, "")], action_log, cx);
-                    *edit_cursor = delete_end;
-                }
-                CharOperation::Keep { bytes } => {
-                    *edit_cursor += bytes;
-                }
+fn apply_char_operations(
+    ops: &[CharOperation],
+    buffer: &Entity<Buffer>,
+    snapshot: &text::BufferSnapshot,
+    edit_cursor: &mut usize,
+    action_log: &Entity<ActionLog>,
+    cx: &mut AsyncApp,
+) {
+    for op in ops {
+        match op {
+            CharOperation::Insert { text } => {
+                let anchor = snapshot.anchor_after(*edit_cursor);
+                agent_edit_buffer(&buffer, [(anchor..anchor, text.as_str())], action_log, cx);
             }
+            CharOperation::Delete { bytes } => {
+                let delete_end = *edit_cursor + bytes;
+                let anchor_range = snapshot.anchor_range_inside(*edit_cursor..delete_end);
+                agent_edit_buffer(&buffer, [(anchor_range, "")], action_log, cx);
+                *edit_cursor = delete_end;
+            }
+            CharOperation::Keep { bytes } => {
+                *edit_cursor += bytes;
+            }
+        }
+    }
+}
+
+fn extract_match(
+    matches: Vec<Range<usize>>,
+    buffer: &Entity<Buffer>,
+    edit_index: &usize,
+    file_changed_since_last_read: bool,
+    cx: &mut AsyncApp,
+) -> Result<Range<usize>, String> {
+    let file_changed_since_last_read_message = if file_changed_since_last_read {
+        " The file has changed on disk since you last read it."
+    } else {
+        ""
+    };
+
+    match matches.len() {
+        0 => Err(format!(
+            "Could not find matching text for edit at index {}. \
+                The old_text did not match any content in the file.{} \
+                Please read the file again to get the current content.",
+            edit_index, file_changed_since_last_read_message,
+        )),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        _ => {
+            let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+            let lines = matches
+                .iter()
+                .map(|r| (snapshot.offset_to_point(r.start).row + 1).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "Edit {} matched multiple locations in the file at lines: {}. \
+                    Please provide more context in old_text to uniquely \
+                    identify the location.",
+                edit_index, lines
+            ))
         }
     }
 }
@@ -997,7 +1094,7 @@ impl EditSession {
 fn agent_edit_buffer<I, S, T>(
     buffer: &Entity<Buffer>,
     edits: I,
-    action_log: Option<&Entity<ActionLog>>,
+    action_log: &Entity<ActionLog>,
     cx: &mut AsyncApp,
 ) where
     I: IntoIterator<Item = (Range<S>, T)>,
@@ -1008,9 +1105,7 @@ fn agent_edit_buffer<I, S, T>(
         buffer.update(cx, |buffer, cx| {
             buffer.edit(edits, None, cx);
         });
-        if let Some(action_log) = action_log {
-            action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
-        }
+        action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
     });
 }
 
@@ -1019,9 +1114,11 @@ fn ensure_buffer_saved(
     abs_path: &PathBuf,
     tool: &StreamingEditFileTool,
     cx: &mut AsyncApp,
-) -> Result<(), StreamingEditFileToolOutput> {
-    let check_result = tool.thread.update(cx, |thread, cx| {
-        let last_read = thread.file_read_times.get(abs_path).copied();
+) -> Result<bool, String> {
+    let last_read_mtime = tool
+        .action_log
+        .read_with(cx, |log, _| log.file_read_time(abs_path));
+    let check_result = tool.thread.read_with(cx, |thread, cx| {
         let current = buffer
             .read(cx)
             .file()
@@ -1029,13 +1126,11 @@ fn ensure_buffer_saved(
         let dirty = buffer.read(cx).is_dirty();
         let has_save = thread.has_tool(SaveFileTool::NAME);
         let has_restore = thread.has_tool(RestoreFileFromDiskTool::NAME);
-        (last_read, current, dirty, has_save, has_restore)
+        (current, dirty, has_save, has_restore)
     });
 
-    let Ok((last_read_mtime, current_mtime, is_dirty, has_save_tool, has_restore_tool)) =
-        check_result
-    else {
-        return Ok(());
+    let Ok((current_mtime, is_dirty, has_save_tool, has_restore_tool)) = check_result else {
+        return Ok(false);
     };
 
     if is_dirty {
@@ -1060,19 +1155,16 @@ fn ensure_buffer_saved(
                          then ask them to save or revert the file manually and inform you when it's ok to proceed."
             }
         };
-        return Err(StreamingEditFileToolOutput::error(message));
+        return Err(message.to_string());
     }
 
-    if let (Some(last_read), Some(current)) = (last_read_mtime, current_mtime) {
-        if current != last_read {
-            return Err(StreamingEditFileToolOutput::error(
-                "The file has been modified since you last read it. \
-                             Please read the file again to get the current state before editing it.",
-            ));
-        }
+    if let (Some(last_read), Some(current)) = (last_read_mtime, current_mtime)
+        && current != last_read
+    {
+        return Ok(true);
     }
 
-    Ok(())
+    Ok(false)
 }
 
 fn resolve_path(
@@ -1080,56 +1172,63 @@ fn resolve_path(
     path: &PathBuf,
     project: &Entity<Project>,
     cx: &mut App,
-) -> Result<ProjectPath> {
+) -> Result<ProjectPath, String> {
     let project = project.read(cx);
 
     match mode {
         StreamingEditFileMode::Edit => {
             let path = project
                 .find_project_path(&path, cx)
-                .context("Can't edit file: path not found")?;
+                .ok_or_else(|| "Can't edit file: path not found".to_string())?;
 
             let entry = project
                 .entry_for_path(&path, cx)
-                .context("Can't edit file: path not found")?;
+                .ok_or_else(|| "Can't edit file: path not found".to_string())?;
 
-            anyhow::ensure!(entry.is_file(), "Can't edit file: path is a directory");
-            Ok(path)
+            if entry.is_file() {
+                Ok(path)
+            } else {
+                Err("Can't edit file: path is a directory".to_string())
+            }
         }
         StreamingEditFileMode::Write => {
             if let Some(path) = project.find_project_path(&path, cx)
                 && let Some(entry) = project.entry_for_path(&path, cx)
             {
-                anyhow::ensure!(entry.is_file(), "Can't write to file: path is a directory");
-                return Ok(path);
+                if entry.is_file() {
+                    return Ok(path);
+                } else {
+                    return Err("Can't write to file: path is a directory".to_string());
+                }
             }
 
-            let parent_path = path.parent().context("Can't create file: incorrect path")?;
+            let parent_path = path
+                .parent()
+                .ok_or_else(|| "Can't create file: incorrect path".to_string())?;
 
             let parent_project_path = project.find_project_path(&parent_path, cx);
 
             let parent_entry = parent_project_path
                 .as_ref()
                 .and_then(|path| project.entry_for_path(path, cx))
-                .context("Can't create file: parent directory doesn't exist")?;
+                .ok_or_else(|| "Can't create file: parent directory doesn't exist")?;
 
-            anyhow::ensure!(
-                parent_entry.is_dir(),
-                "Can't create file: parent is not a directory"
-            );
+            if !parent_entry.is_dir() {
+                return Err("Can't create file: parent is not a directory".to_string());
+            }
 
             let file_name = path
                 .file_name()
                 .and_then(|file_name| file_name.to_str())
                 .and_then(|file_name| RelPath::unix(file_name).ok())
-                .context("Can't create file: invalid filename")?;
+                .ok_or_else(|| "Can't create file: invalid filename".to_string())?;
 
             let new_file_path = parent_project_path.map(|parent| ProjectPath {
                 path: parent.path.join(file_name),
                 ..parent
             });
 
-            new_file_path.context("Can't create file")
+            new_file_path.ok_or_else(|| "Can't create file".to_string())
         }
     }
 }
@@ -1151,42 +1250,17 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_edit_create_file(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree("/root", json!({"dir": {}})).await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
+        let (tool, _project, _action_log, _fs, _thread) = setup_test(cx, json!({"dir": {}})).await;
         let result = cx
             .update(|cx| {
-                let input = StreamingEditFileToolInput {
-                    display_description: "Create new file".into(),
-                    path: "root/dir/new_file.txt".into(),
-                    mode: StreamingEditFileMode::Write,
-                    content: Some("Hello, World!".into()),
-                    edits: None,
-                };
-                Arc::new(StreamingEditFileTool::new(
-                    project.clone(),
-                    thread.downgrade(),
-                    language_registry,
-                ))
-                .run(
-                    ToolInput::resolved(input),
+                tool.clone().run(
+                    ToolInput::resolved(StreamingEditFileToolInput {
+                        display_description: "Create new file".into(),
+                        path: "root/dir/new_file.txt".into(),
+                        mode: StreamingEditFileMode::Write,
+                        content: Some("Hello, World!".into()),
+                        edits: None,
+                    }),
                     ToolCallEventStream::test().0,
                     cx,
                 )
@@ -1202,43 +1276,18 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_edit_overwrite_file(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree("/root", json!({"file.txt": "old content"}))
-            .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "old content"})).await;
         let result = cx
             .update(|cx| {
-                let input = StreamingEditFileToolInput {
-                    display_description: "Overwrite file".into(),
-                    path: "root/file.txt".into(),
-                    mode: StreamingEditFileMode::Write,
-                    content: Some("new content".into()),
-                    edits: None,
-                };
-                Arc::new(StreamingEditFileTool::new(
-                    project.clone(),
-                    thread.downgrade(),
-                    language_registry,
-                ))
-                .run(
-                    ToolInput::resolved(input),
+                tool.clone().run(
+                    ToolInput::resolved(StreamingEditFileToolInput {
+                        display_description: "Overwrite file".into(),
+                        path: "root/file.txt".into(),
+                        mode: StreamingEditFileMode::Write,
+                        content: Some("new content".into()),
+                        edits: None,
+                    }),
                     ToolCallEventStream::test().0,
                     cx,
                 )
@@ -1257,51 +1306,21 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_edit_granular_edits(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "line 1\nline 2\nline 3\n"
-            }),
-        )
-        .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "line 1\nline 2\nline 3\n"})).await;
         let result = cx
             .update(|cx| {
-                let input = StreamingEditFileToolInput {
-                    display_description: "Edit lines".into(),
-                    path: "root/file.txt".into(),
-                    mode: StreamingEditFileMode::Edit,
-                    content: None,
-                    edits: Some(vec![Edit {
-                        old_text: "line 2".into(),
-                        new_text: "modified line 2".into(),
-                    }]),
-                };
-                Arc::new(StreamingEditFileTool::new(
-                    project.clone(),
-                    thread.downgrade(),
-                    language_registry,
-                ))
-                .run(
-                    ToolInput::resolved(input),
+                tool.clone().run(
+                    ToolInput::resolved(StreamingEditFileToolInput {
+                        display_description: "Edit lines".into(),
+                        path: "root/file.txt".into(),
+                        mode: StreamingEditFileMode::Edit,
+                        content: None,
+                        edits: Some(vec![Edit {
+                            old_text: "line 2".into(),
+                            new_text: "modified line 2".into(),
+                        }]),
+                    }),
                     ToolCallEventStream::test().0,
                     cx,
                 )
@@ -1316,57 +1335,30 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_edit_multiple_edits(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "line 1\nline 2\nline 3\nline 4\nline 5\n"
-            }),
+        let (tool, _project, _action_log, _fs, _thread) = setup_test(
+            cx,
+            json!({"file.txt": "line 1\nline 2\nline 3\nline 4\nline 5\n"}),
         )
         .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
         let result = cx
             .update(|cx| {
-                let input = StreamingEditFileToolInput {
-                    display_description: "Edit multiple lines".into(),
-                    path: "root/file.txt".into(),
-                    mode: StreamingEditFileMode::Edit,
-                    content: None,
-                    edits: Some(vec![
-                        Edit {
-                            old_text: "line 5".into(),
-                            new_text: "modified line 5".into(),
-                        },
-                        Edit {
-                            old_text: "line 1".into(),
-                            new_text: "modified line 1".into(),
-                        },
-                    ]),
-                };
-                Arc::new(StreamingEditFileTool::new(
-                    project.clone(),
-                    thread.downgrade(),
-                    language_registry,
-                ))
-                .run(
-                    ToolInput::resolved(input),
+                tool.clone().run(
+                    ToolInput::resolved(StreamingEditFileToolInput {
+                        display_description: "Edit multiple lines".into(),
+                        path: "root/file.txt".into(),
+                        mode: StreamingEditFileMode::Edit,
+                        content: None,
+                        edits: Some(vec![
+                            Edit {
+                                old_text: "line 5".into(),
+                                new_text: "modified line 5".into(),
+                            },
+                            Edit {
+                                old_text: "line 1".into(),
+                                new_text: "modified line 1".into(),
+                            },
+                        ]),
+                    }),
                     ToolCallEventStream::test().0,
                     cx,
                 )
@@ -1384,57 +1376,30 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_edit_adjacent_edits(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "line 1\nline 2\nline 3\nline 4\nline 5\n"
-            }),
+        let (tool, _project, _action_log, _fs, _thread) = setup_test(
+            cx,
+            json!({"file.txt": "line 1\nline 2\nline 3\nline 4\nline 5\n"}),
         )
         .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
         let result = cx
             .update(|cx| {
-                let input = StreamingEditFileToolInput {
-                    display_description: "Edit adjacent lines".into(),
-                    path: "root/file.txt".into(),
-                    mode: StreamingEditFileMode::Edit,
-                    content: None,
-                    edits: Some(vec![
-                        Edit {
-                            old_text: "line 2".into(),
-                            new_text: "modified line 2".into(),
-                        },
-                        Edit {
-                            old_text: "line 3".into(),
-                            new_text: "modified line 3".into(),
-                        },
-                    ]),
-                };
-                Arc::new(StreamingEditFileTool::new(
-                    project.clone(),
-                    thread.downgrade(),
-                    language_registry,
-                ))
-                .run(
-                    ToolInput::resolved(input),
+                tool.clone().run(
+                    ToolInput::resolved(StreamingEditFileToolInput {
+                        display_description: "Edit adjacent lines".into(),
+                        path: "root/file.txt".into(),
+                        mode: StreamingEditFileMode::Edit,
+                        content: None,
+                        edits: Some(vec![
+                            Edit {
+                                old_text: "line 2".into(),
+                                new_text: "modified line 2".into(),
+                            },
+                            Edit {
+                                old_text: "line 3".into(),
+                                new_text: "modified line 3".into(),
+                            },
+                        ]),
+                    }),
                     ToolCallEventStream::test().0,
                     cx,
                 )
@@ -1452,57 +1417,30 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_edit_ascending_order_edits(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "line 1\nline 2\nline 3\nline 4\nline 5\n"
-            }),
+        let (tool, _project, _action_log, _fs, _thread) = setup_test(
+            cx,
+            json!({"file.txt": "line 1\nline 2\nline 3\nline 4\nline 5\n"}),
         )
         .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
         let result = cx
             .update(|cx| {
-                let input = StreamingEditFileToolInput {
-                    display_description: "Edit multiple lines in ascending order".into(),
-                    path: "root/file.txt".into(),
-                    mode: StreamingEditFileMode::Edit,
-                    content: None,
-                    edits: Some(vec![
-                        Edit {
-                            old_text: "line 1".into(),
-                            new_text: "modified line 1".into(),
-                        },
-                        Edit {
-                            old_text: "line 5".into(),
-                            new_text: "modified line 5".into(),
-                        },
-                    ]),
-                };
-                Arc::new(StreamingEditFileTool::new(
-                    project.clone(),
-                    thread.downgrade(),
-                    language_registry,
-                ))
-                .run(
-                    ToolInput::resolved(input),
+                tool.clone().run(
+                    ToolInput::resolved(StreamingEditFileToolInput {
+                        display_description: "Edit multiple lines in ascending order".into(),
+                        path: "root/file.txt".into(),
+                        mode: StreamingEditFileMode::Edit,
+                        content: None,
+                        edits: Some(vec![
+                            Edit {
+                                old_text: "line 1".into(),
+                                new_text: "modified line 1".into(),
+                            },
+                            Edit {
+                                old_text: "line 5".into(),
+                                new_text: "modified line 5".into(),
+                            },
+                        ]),
+                    }),
                     ToolCallEventStream::test().0,
                     cx,
                 )
@@ -1520,106 +1458,63 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_edit_nonexistent_file(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree("/root", json!({})).await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
+        let (tool, _project, _action_log, _fs, _thread) = setup_test(cx, json!({})).await;
         let result = cx
             .update(|cx| {
-                let input = StreamingEditFileToolInput {
-                    display_description: "Some edit".into(),
-                    path: "root/nonexistent_file.txt".into(),
-                    mode: StreamingEditFileMode::Edit,
-                    content: None,
-                    edits: Some(vec![Edit {
-                        old_text: "foo".into(),
-                        new_text: "bar".into(),
-                    }]),
-                };
-                Arc::new(StreamingEditFileTool::new(
-                    project,
-                    thread.downgrade(),
-                    language_registry,
-                ))
-                .run(
-                    ToolInput::resolved(input),
+                tool.clone().run(
+                    ToolInput::resolved(StreamingEditFileToolInput {
+                        display_description: "Some edit".into(),
+                        path: "root/nonexistent_file.txt".into(),
+                        mode: StreamingEditFileMode::Edit,
+                        content: None,
+                        edits: Some(vec![Edit {
+                            old_text: "foo".into(),
+                            new_text: "bar".into(),
+                        }]),
+                    }),
                     ToolCallEventStream::test().0,
                     cx,
                 )
             })
             .await;
 
-        let StreamingEditFileToolOutput::Error { error } = result.unwrap_err() else {
+        let StreamingEditFileToolOutput::Error {
+            error,
+            diff,
+            input_path,
+        } = result.unwrap_err()
+        else {
             panic!("expected error");
         };
         assert_eq!(error, "Can't edit file: path not found");
+        assert!(diff.is_empty());
+        assert_eq!(input_path, None);
     }
 
     #[gpui::test]
     async fn test_streaming_edit_failed_match(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree("/root", json!({"file.txt": "hello world"}))
-            .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "hello world"})).await;
         let result = cx
             .update(|cx| {
-                let input = StreamingEditFileToolInput {
-                    display_description: "Edit file".into(),
-                    path: "root/file.txt".into(),
-                    mode: StreamingEditFileMode::Edit,
-                    content: None,
-                    edits: Some(vec![Edit {
-                        old_text: "nonexistent text that is not in the file".into(),
-                        new_text: "replacement".into(),
-                    }]),
-                };
-                Arc::new(StreamingEditFileTool::new(
-                    project,
-                    thread.downgrade(),
-                    language_registry,
-                ))
-                .run(
-                    ToolInput::resolved(input),
+                tool.clone().run(
+                    ToolInput::resolved(StreamingEditFileToolInput {
+                        display_description: "Edit file".into(),
+                        path: "root/file.txt".into(),
+                        mode: StreamingEditFileMode::Edit,
+                        content: None,
+                        edits: Some(vec![Edit {
+                            old_text: "nonexistent text that is not in the file".into(),
+                            new_text: "replacement".into(),
+                        }]),
+                    }),
                     ToolCallEventStream::test().0,
                     cx,
                 )
             })
             .await;
 
-        let StreamingEditFileToolOutput::Error { error } = result.unwrap_err() else {
+        let StreamingEditFileToolOutput::Error { error, .. } = result.unwrap_err() else {
             panic!("expected error");
         };
         assert!(
@@ -1630,42 +1525,11 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_early_buffer_open(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "line 1\nline 2\nline 3\n"
-            }),
-        )
-        .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "line 1\nline 2\nline 3\n"})).await;
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver) = ToolCallEventStream::test();
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Send partials simulating LLM streaming: description first, then path, then mode
         sender.send_partial(json!({"display_description": "Edit lines"}));
@@ -1686,7 +1550,7 @@ mod tests {
         cx.run_until_parked();
 
         // Now send the final complete input
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Edit lines",
             "path": "root/file.txt",
             "mode": "edit",
@@ -1702,42 +1566,11 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_path_completeness_heuristic(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "hello world"
-            }),
-        )
-        .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "hello world"})).await;
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver) = ToolCallEventStream::test();
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Send partial with path but NO mode — path should NOT be treated as complete
         sender.send_partial(json!({
@@ -1755,7 +1588,7 @@ mod tests {
         cx.run_until_parked();
 
         // Send final
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Overwrite file",
             "path": "root/file.txt",
             "mode": "write",
@@ -1771,43 +1604,12 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_cancellation_during_partials(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "hello world"
-            }),
-        )
-        .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "hello world"})).await;
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver, mut cancellation_tx) =
             ToolCallEventStream::test_with_cancellation();
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Send a partial
         sender.send_partial(json!({"display_description": "Edit"}));
@@ -1822,7 +1624,7 @@ mod tests {
         drop(sender);
 
         let result = task.await;
-        let StreamingEditFileToolOutput::Error { error } = result.unwrap_err() else {
+        let StreamingEditFileToolOutput::Error { error, .. } = result.unwrap_err() else {
             panic!("expected error");
         };
         assert!(
@@ -1833,42 +1635,14 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_edit_with_multiple_partials(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "line 1\nline 2\nline 3\nline 4\nline 5\n"
-            }),
+        let (tool, _project, _action_log, _fs, _thread) = setup_test(
+            cx,
+            json!({"file.txt": "line 1\nline 2\nline 3\nline 4\nline 5\n"}),
         )
         .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver) = ToolCallEventStream::test();
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Simulate fine-grained streaming of the JSON
         sender.send_partial(json!({"display_description": "Edit multiple"}));
@@ -1907,7 +1681,7 @@ mod tests {
         cx.run_until_parked();
 
         // Send final complete input
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Edit multiple lines",
             "path": "root/file.txt",
             "mode": "edit",
@@ -1929,36 +1703,10 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_create_file_with_partials(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree("/root", json!({"dir": {}})).await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (tool, _project, _action_log, _fs, _thread) = setup_test(cx, json!({"dir": {}})).await;
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver) = ToolCallEventStream::test();
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Stream partials for create mode
         sender.send_partial(json!({"display_description": "Create new file"}));
@@ -1980,7 +1728,7 @@ mod tests {
         cx.run_until_parked();
 
         // Final with full content
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Create new file",
             "path": "root/dir/new_file.txt",
             "mode": "write",
@@ -1996,45 +1744,14 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_no_partials_direct_final(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "line 1\nline 2\nline 3\n"
-            }),
-        )
-        .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "line 1\nline 2\nline 3\n"})).await;
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver) = ToolCallEventStream::test();
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Send final immediately with no partials (simulates non-streaming path)
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Edit lines",
             "path": "root/file.txt",
             "mode": "edit",
@@ -2050,42 +1767,14 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_incremental_edit_application(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "line 1\nline 2\nline 3\nline 4\nline 5\n"
-            }),
+        let (tool, project, _action_log, _fs, _thread) = setup_test(
+            cx,
+            json!({"file.txt": "line 1\nline 2\nline 3\nline 4\nline 5\n"}),
         )
         .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver) = ToolCallEventStream::test();
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Stream description, path, mode
         sender.send_partial(json!({"display_description": "Edit multiple lines"}));
@@ -2153,7 +1842,7 @@ mod tests {
         );
 
         // Send final complete input
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Edit multiple lines",
             "path": "root/file.txt",
             "mode": "edit",
@@ -2179,42 +1868,11 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_incremental_three_edits(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "aaa\nbbb\nccc\nddd\neee\n"
-            }),
-        )
-        .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (tool, project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "aaa\nbbb\nccc\nddd\neee\n"})).await;
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver) = ToolCallEventStream::test();
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Setup: description + path + mode
         sender.send_partial(json!({
@@ -2280,7 +1938,7 @@ mod tests {
         assert_eq!(buffer_text.as_deref(), Some("AAA\nbbb\nCCC\nddd\nEEEeee\n"));
 
         // Send final
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Edit three lines",
             "path": "root/file.txt",
             "mode": "edit",
@@ -2300,42 +1958,11 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_edit_failure_mid_stream(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "line 1\nline 2\nline 3\n"
-            }),
-        )
-        .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (tool, project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "line 1\nline 2\nline 3\n"})).await;
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver) = ToolCallEventStream::test();
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Setup
         sender.send_partial(json!({
@@ -2369,16 +1996,17 @@ mod tests {
         }));
         cx.run_until_parked();
 
-        // Verify edit 1 was applied
-        let buffer_text = project.update(cx, |project, cx| {
+        let buffer = project.update(cx, |project, cx| {
             let pp = project
                 .find_project_path(&PathBuf::from("root/file.txt"), cx)
                 .unwrap();
-            project.get_open_buffer(&pp, cx).map(|b| b.read(cx).text())
+            project.get_open_buffer(&pp, cx).unwrap()
         });
+
+        // Verify edit 1 was applied
+        let buffer_text = buffer.read_with(cx, |buffer, _cx| buffer.text());
         assert_eq!(
-            buffer_text.as_deref(),
-            Some("MODIFIED\nline 2\nline 3\n"),
+            buffer_text, "MODIFIED\nline 2\nline 3\n",
             "First edit should be applied even though second edit will fail"
         );
 
@@ -2401,55 +2029,43 @@ mod tests {
         drop(sender);
 
         let result = task.await;
-        let StreamingEditFileToolOutput::Error { error } = result.unwrap_err() else {
+        let StreamingEditFileToolOutput::Error {
+            error,
+            diff,
+            input_path,
+        } = result.unwrap_err()
+        else {
             panic!("expected error");
         };
+
         assert!(
             error.contains("Could not find matching text for edit at index 1"),
             "Expected error about edit 1 failing, got: {error}"
+        );
+        // Ensure that first edit was applied successfully and that we saved the buffer
+        assert_eq!(input_path, Some(PathBuf::from("root/file.txt")));
+        assert_eq!(
+            diff,
+            "@@ -1,3 +1,3 @@\n-line 1\n+MODIFIED\n line 2\n line 3\n"
         );
     }
 
     #[gpui::test]
     async fn test_streaming_single_edit_no_incremental(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "hello world\n"
-            }),
-        )
-        .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (tool, project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "hello world\n"})).await;
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver) = ToolCallEventStream::test();
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Setup + single edit that stays in-progress (no second edit to prove completion)
+        sender.send_partial(json!({
+            "display_description": "Single edit",
+            "path": "root/file.txt",
+            "mode": "edit",
+        }));
+        cx.run_until_parked();
+
         sender.send_partial(json!({
             "display_description": "Single edit",
             "path": "root/file.txt",
@@ -2475,7 +2091,7 @@ mod tests {
         );
 
         // Send final — the edit is applied during finalization
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Single edit",
             "path": "root/file.txt",
             "mode": "edit",
@@ -2491,44 +2107,12 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_input_partials_then_final(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "line 1\nline 2\nline 3\n"
-            }),
-        )
-        .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input): (ToolInputSender, ToolInput<StreamingEditFileToolInput>) =
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "line 1\nline 2\nline 3\n"})).await;
+        let (mut sender, input): (ToolInputSender, ToolInput<StreamingEditFileToolInput>) =
             ToolInput::test();
-
         let (event_stream, _event_rx) = ToolCallEventStream::test();
-        let task = cx.update(|cx| {
-            Arc::new(StreamingEditFileTool::new(
-                project.clone(),
-                thread.downgrade(),
-                language_registry,
-            ))
-            .run(input, event_stream, cx)
-        });
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Send progressively more complete partial snapshots, as the LLM would
         sender.send_partial(json!({
@@ -2552,7 +2136,7 @@ mod tests {
         cx.run_until_parked();
 
         // Send the final complete input
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Edit lines",
             "path": "root/file.txt",
             "mode": "edit",
@@ -2568,44 +2152,12 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_input_sender_dropped_before_final(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "hello world\n"
-            }),
-        )
-        .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input): (ToolInputSender, ToolInput<StreamingEditFileToolInput>) =
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "hello world\n"})).await;
+        let (mut sender, input): (ToolInputSender, ToolInput<StreamingEditFileToolInput>) =
             ToolInput::test();
-
         let (event_stream, _event_rx) = ToolCallEventStream::test();
-        let task = cx.update(|cx| {
-            Arc::new(StreamingEditFileTool::new(
-                project.clone(),
-                thread.downgrade(),
-                language_registry,
-            ))
-            .run(input, event_stream, cx)
-        });
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Send a partial then drop the sender without sending final
         sender.send_partial(json!({
@@ -2624,41 +2176,14 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_input_recv_drains_partials(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree("/root", json!({"dir": {}})).await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
+        let (tool, _project, _action_log, _fs, _thread) = setup_test(cx, json!({"dir": {}})).await;
         // Create a channel and send multiple partials before a final, then use
         // ToolInput::resolved-style immediate delivery to confirm recv() works
         // when partials are already buffered.
-        let (sender, input): (ToolInputSender, ToolInput<StreamingEditFileToolInput>) =
+        let (mut sender, input): (ToolInputSender, ToolInput<StreamingEditFileToolInput>) =
             ToolInput::test();
-
         let (event_stream, _event_rx) = ToolCallEventStream::test();
-        let task = cx.update(|cx| {
-            Arc::new(StreamingEditFileTool::new(
-                project.clone(),
-                thread.downgrade(),
-                language_registry,
-            ))
-            .run(input, event_stream, cx)
-        });
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Buffer several partials before sending the final
         sender.send_partial(json!({"display_description": "Create"}));
@@ -2668,7 +2193,7 @@ mod tests {
             "path": "root/dir/new.txt",
             "mode": "write"
         }));
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Create",
             "path": "root/dir/new.txt",
             "mode": "write",
@@ -2700,13 +2225,13 @@ mod tests {
 
         let result = test_resolve_path(&mode, "root/dir/subdir", cx);
         assert_eq!(
-            result.await.unwrap_err().to_string(),
+            result.await.unwrap_err(),
             "Can't write to file: path is a directory"
         );
 
         let result = test_resolve_path(&mode, "root/dir/nonexistent_dir/new.txt", cx);
         assert_eq!(
-            result.await.unwrap_err().to_string(),
+            result.await.unwrap_err(),
             "Can't create file: parent directory doesn't exist"
         );
     }
@@ -2724,14 +2249,11 @@ mod tests {
         assert_resolved_path_eq(result.await, rel_path(path_without_root));
 
         let result = test_resolve_path(&mode, "root/nonexistent.txt", cx);
-        assert_eq!(
-            result.await.unwrap_err().to_string(),
-            "Can't edit file: path not found"
-        );
+        assert_eq!(result.await.unwrap_err(), "Can't edit file: path not found");
 
         let result = test_resolve_path(&mode, "root/dir", cx);
         assert_eq!(
-            result.await.unwrap_err().to_string(),
+            result.await.unwrap_err(),
             "Can't edit file: path is a directory"
         );
     }
@@ -2740,7 +2262,7 @@ mod tests {
         mode: &StreamingEditFileMode,
         path: &str,
         cx: &mut TestAppContext,
-    ) -> anyhow::Result<ProjectPath> {
+    ) -> Result<ProjectPath, String> {
         init_test(cx);
 
         let fs = project::FakeFs::new(cx.executor());
@@ -2757,11 +2279,11 @@ mod tests {
         .await;
         let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
 
-        cx.update(|cx| resolve_path(mode.clone(), &PathBuf::from(path), &project, cx))
+        cx.update(|cx| resolve_path(*mode, &PathBuf::from(path), &project, cx))
     }
 
     #[track_caller]
-    fn assert_resolved_path_eq(path: anyhow::Result<ProjectPath>, expected: &RelPath) {
+    fn assert_resolved_path_eq(path: Result<ProjectPath, String>, expected: &RelPath) {
         let actual = path.expect("Should return valid path").path;
         assert_eq!(actual.as_ref(), expected);
     }
@@ -2772,8 +2294,8 @@ mod tests {
 
         let fs = project::FakeFs::new(cx.executor());
         fs.insert_tree("/root", json!({"src": {}})).await;
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (tool, project, action_log, fs, thread) =
+            setup_test_with_fs(cx, fs, &[path!("/root").as_ref()]).await;
 
         let rust_language = Arc::new(language::Language::new(
             language::LanguageConfig {
@@ -2822,9 +2344,10 @@ mod tests {
             project.register_buffer_with_language_servers(&buffer, cx)
         });
 
-        const UNFORMATTED_CONTENT: &str = "fn main() {println!(\"Hello!\");}\n";
-        const FORMATTED_CONTENT: &str =
-            "This file was formatted by the fake formatter in the test.\n";
+        const UNFORMATTED_CONTENT: &str = "fn main() {println!(\"Hello!\");}\
+";
+        const FORMATTED_CONTENT: &str = "This file was formatted by the fake formatter in the test.\
+";
 
         // Get the fake language server and set up formatting handler
         let fake_language_server = fake_language_servers.next().await.unwrap();
@@ -2835,20 +2358,6 @@ mod tests {
                     new_text: FORMATTED_CONTENT.to_string(),
                 }]))
             }
-        });
-
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model.clone()),
-                cx,
-            )
         });
 
         // Test with format_on_save enabled
@@ -2863,16 +2372,10 @@ mod tests {
         });
 
         // Use streaming pattern so executor can pump the LSP request/response
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver) = ToolCallEventStream::test();
 
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry.clone(),
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         sender.send_partial(json!({
             "display_description": "Create main function",
@@ -2881,7 +2384,7 @@ mod tests {
         }));
         cx.run_until_parked();
 
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Create main function",
             "path": "root/src/main.rs",
             "mode": "write",
@@ -2920,16 +2423,17 @@ mod tests {
             });
         });
 
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver) = ToolCallEventStream::test();
 
-        let tool = Arc::new(StreamingEditFileTool::new(
+        let tool2 = Arc::new(StreamingEditFileTool::new(
             project.clone(),
             thread.downgrade(),
+            action_log.clone(),
             language_registry,
         ));
 
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool2.run(input, event_stream, cx));
 
         sender.send_partial(json!({
             "display_description": "Update main function",
@@ -2938,7 +2442,7 @@ mod tests {
         }));
         cx.run_until_parked();
 
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Update main function",
             "path": "root/src/main.rs",
             "mode": "write",
@@ -2964,7 +2468,6 @@ mod tests {
 
         let fs = project::FakeFs::new(cx.executor());
         fs.insert_tree("/root", json!({"src": {}})).await;
-
         fs.save(
             path!("/root/src/main.rs").as_ref(),
             &"initial content".into(),
@@ -2972,22 +2475,9 @@ mod tests {
         )
         .await
         .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model.clone()),
-                cx,
-            )
-        });
+        let (tool, project, action_log, fs, thread) =
+            setup_test_with_fs(cx, fs, &[path!("/root").as_ref()]).await;
+        let language_registry = project.read_with(cx, |p, _cx| p.languages().clone());
 
         // Test with remove_trailing_whitespace_on_save enabled
         cx.update(|cx| {
@@ -3007,20 +2497,14 @@ mod tests {
 
         let result = cx
             .update(|cx| {
-                let input = StreamingEditFileToolInput {
-                    display_description: "Create main function".into(),
-                    path: "root/src/main.rs".into(),
-                    mode: StreamingEditFileMode::Write,
-                    content: Some(CONTENT_WITH_TRAILING_WHITESPACE.into()),
-                    edits: None,
-                };
-                Arc::new(StreamingEditFileTool::new(
-                    project.clone(),
-                    thread.downgrade(),
-                    language_registry.clone(),
-                ))
-                .run(
-                    ToolInput::resolved(input),
+                tool.clone().run(
+                    ToolInput::resolved(StreamingEditFileToolInput {
+                        display_description: "Create main function".into(),
+                        path: "root/src/main.rs".into(),
+                        mode: StreamingEditFileMode::Write,
+                        content: Some(CONTENT_WITH_TRAILING_WHITESPACE.into()),
+                        edits: None,
+                    }),
                     ToolCallEventStream::test().0,
                     cx,
                 )
@@ -3052,22 +2536,23 @@ mod tests {
             });
         });
 
+        let tool2 = Arc::new(StreamingEditFileTool::new(
+            project.clone(),
+            thread.downgrade(),
+            action_log.clone(),
+            language_registry,
+        ));
+
         let result = cx
             .update(|cx| {
-                let input = StreamingEditFileToolInput {
-                    display_description: "Update main function".into(),
-                    path: "root/src/main.rs".into(),
-                    mode: StreamingEditFileMode::Write,
-                    content: Some(CONTENT_WITH_TRAILING_WHITESPACE.into()),
-                    edits: None,
-                };
-                Arc::new(StreamingEditFileTool::new(
-                    project.clone(),
-                    thread.downgrade(),
-                    language_registry,
-                ))
-                .run(
-                    ToolInput::resolved(input),
+                tool2.run(
+                    ToolInput::resolved(StreamingEditFileToolInput {
+                        display_description: "Update main function".into(),
+                        path: "root/src/main.rs".into(),
+                        mode: StreamingEditFileMode::Write,
+                        content: Some(CONTENT_WITH_TRAILING_WHITESPACE.into()),
+                        edits: None,
+                    }),
                     ToolCallEventStream::test().0,
                     cx,
                 )
@@ -3087,29 +2572,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_authorize(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = project::FakeFs::new(cx.executor());
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model.clone()),
-                cx,
-            )
-        });
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-        fs.insert_tree("/root", json!({})).await;
+        let (tool, _project, _action_log, _fs, _thread) = setup_test(cx, json!({})).await;
 
         // Test 1: Path with .zed component should require confirmation
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
@@ -3143,7 +2606,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(stream_rx.try_next().is_err());
+        assert!(stream_rx.try_recv().is_err());
 
         // Test 4: Path with .zed in the middle should require confirmation
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
@@ -3190,7 +2653,7 @@ mod tests {
         cx.update(|cx| tool.authorize(&PathBuf::from("/etc/hosts"), "test 5.2", &stream_tx, cx))
             .await
             .unwrap();
-        assert!(stream_rx.try_next().is_err());
+        assert!(stream_rx.try_recv().is_err());
 
         // 5.3: Normal in-project path with allow — no confirmation needed
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
@@ -3204,7 +2667,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(stream_rx.try_next().is_err());
+        assert!(stream_rx.try_recv().is_err());
 
         // 5.4: With Confirm default, non-project paths still prompt
         cx.update(|cx| {
@@ -3230,27 +2693,8 @@ mod tests {
         fs.insert_tree("/outside", json!({})).await;
         fs.insert_symlink("/root/link", PathBuf::from("/outside"))
             .await;
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project,
-            thread.downgrade(),
-            language_registry,
-        ));
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test_with_fs(cx, fs, &[path!("/root").as_ref()]).await;
 
         cx.update(|cx| {
             let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
@@ -3281,7 +2725,10 @@ mod tests {
 
         event
             .response
-            .send(acp::PermissionOptionId::new("allow"))
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp::PermissionOptionId::new("allow"),
+                acp::PermissionOptionKind::AllowOnce,
+            ))
             .unwrap();
         authorize_task.await.unwrap();
     }
@@ -3313,29 +2760,8 @@ mod tests {
         )
         .await
         .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        cx.executor().run_until_parked();
-
-        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test_with_fs(cx, fs, &[path!("/root").as_ref()]).await;
 
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
         let _authorize_task = cx.update(|cx| {
@@ -3380,29 +2806,8 @@ mod tests {
         )
         .await
         .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        cx.executor().run_until_parked();
-
-        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test_with_fs(cx, fs, &[path!("/root").as_ref()]).await;
 
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
         let authorize_task = cx.update(|cx| {
@@ -3457,29 +2862,8 @@ mod tests {
         )
         .await
         .unwrap();
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        cx.executor().run_until_parked();
-
-        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test_with_fs(cx, fs, &[path!("/root").as_ref()]).await;
 
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
         let result = cx
@@ -3496,8 +2880,8 @@ mod tests {
         assert!(result.is_err(), "Tool should fail when policy denies");
         assert!(
             !matches!(
-                stream_rx.try_next(),
-                Ok(Some(Ok(crate::ThreadEvent::ToolCallAuthorization(_))))
+                stream_rx.try_recv(),
+                Ok(Ok(crate::ThreadEvent::ToolCallAuthorization(_)))
             ),
             "Deny policy should not emit symlink authorization prompt",
         );
@@ -3508,26 +2892,8 @@ mod tests {
         init_test(cx);
         let fs = project::FakeFs::new(cx.executor());
         fs.insert_tree("/project", json!({})).await;
-        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model.clone()),
-                cx,
-            )
-        });
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test_with_fs(cx, fs, &[path!("/project").as_ref()]).await;
 
         let test_cases = vec![
             (
@@ -3557,7 +2923,7 @@ mod tests {
             } else {
                 auth.await.unwrap();
                 assert!(
-                    stream_rx.try_next().is_err(),
+                    stream_rx.try_recv().is_err(),
                     "Failed for case: {} - path: {} - expected no confirmation but got one",
                     description,
                     path
@@ -3570,7 +2936,6 @@ mod tests {
     async fn test_streaming_needs_confirmation_with_multiple_worktrees(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = project::FakeFs::new(cx.executor());
-
         fs.insert_tree(
             "/workspace/frontend",
             json!({
@@ -3598,36 +2963,16 @@ mod tests {
             }),
         )
         .await;
-
-        let project = Project::test(
-            fs.clone(),
-            [
+        let (tool, _project, _action_log, _fs, _thread) = setup_test_with_fs(
+            cx,
+            fs,
+            &[
                 path!("/workspace/frontend").as_ref(),
                 path!("/workspace/backend").as_ref(),
                 path!("/workspace/shared").as_ref(),
             ],
-            cx,
         )
         .await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry.clone(),
-                Templates::new(),
-                Some(model.clone()),
-                cx,
-            )
-        });
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
 
         let test_cases = vec![
             ("frontend/src/main.js", false, "File in first worktree"),
@@ -3655,7 +3000,7 @@ mod tests {
             } else {
                 auth.await.unwrap();
                 assert!(
-                    stream_rx.try_next().is_err(),
+                    stream_rx.try_recv().is_err(),
                     "Failed for case: {} - path: {} - expected no confirmation but got one",
                     description,
                     path
@@ -3682,26 +3027,8 @@ mod tests {
             }),
         )
         .await;
-        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry.clone(),
-                Templates::new(),
-                Some(model.clone()),
-                cx,
-            )
-        });
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test_with_fs(cx, fs, &[path!("/project").as_ref()]).await;
 
         let test_cases = vec![
             ("", false, "Empty path is treated as project root"),
@@ -3733,7 +3060,7 @@ mod tests {
                 stream_rx.expect_authorization().await;
             } else {
                 assert!(
-                    stream_rx.try_next().is_err(),
+                    stream_rx.try_recv().is_err(),
                     "Failed for case: {} - path: {} - expected no confirmation but got one",
                     description,
                     path
@@ -3757,26 +3084,8 @@ mod tests {
             }),
         )
         .await;
-        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry.clone(),
-                Templates::new(),
-                Some(model.clone()),
-                cx,
-            )
-        });
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test_with_fs(cx, fs, &[path!("/project").as_ref()]).await;
 
         let modes = vec![StreamingEditFileMode::Edit, StreamingEditFileMode::Write];
 
@@ -3819,7 +3128,7 @@ mod tests {
             })
             .await
             .unwrap();
-            assert!(stream_rx.try_next().is_err());
+            assert!(stream_rx.try_recv().is_err());
         }
     }
 
@@ -3827,26 +3136,9 @@ mod tests {
     async fn test_streaming_initial_title_with_partial_input(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = project::FakeFs::new(cx.executor());
-        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model.clone()),
-                cx,
-            )
-        });
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project,
-            thread.downgrade(),
-            language_registry,
-        ));
+        fs.insert_tree("/project", json!({})).await;
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test_with_fs(cx, fs, &[path!("/project").as_ref()]).await;
 
         cx.update(|cx| {
             assert_eq!(
@@ -3901,33 +3193,15 @@ mod tests {
         init_test(cx);
         let fs = project::FakeFs::new(cx.executor());
         fs.insert_tree("/", json!({"main.rs": ""})).await;
-
-        let project = Project::test(fs.clone(), [path!("/").as_ref()], cx).await;
-        let languages = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry.clone(),
-                Templates::new(),
-                Some(model.clone()),
-                cx,
-            )
-        });
+        let (tool, project, action_log, _fs, thread) =
+            setup_test_with_fs(cx, fs, &[path!("/").as_ref()]).await;
+        let language_registry = project.read_with(cx, |p, _cx| p.languages().clone());
 
         // Ensure the diff is finalized after the edit completes.
         {
-            let tool = Arc::new(StreamingEditFileTool::new(
-                project.clone(),
-                thread.downgrade(),
-                languages.clone(),
-            ));
             let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
             let edit = cx.update(|cx| {
-                tool.run(
+                tool.clone().run(
                     ToolInput::resolved(StreamingEditFileToolInput {
                         display_description: "Edit file".into(),
                         path: path!("/main.rs").into(),
@@ -3952,7 +3226,8 @@ mod tests {
             let tool = Arc::new(StreamingEditFileTool::new(
                 project.clone(),
                 thread.downgrade(),
-                languages.clone(),
+                action_log,
+                language_registry,
             ));
             let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
             let edit = cx.update(|cx| {
@@ -3979,42 +3254,12 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_consecutive_edits_work(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "test.txt": "original content"
-            }),
-        )
-        .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model.clone()),
-                cx,
-            )
-        });
-        let languages = project.read_with(cx, |project, _| project.languages().clone());
-        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
-
+        let (tool, project, action_log, _fs, _thread) =
+            setup_test(cx, json!({"test.txt": "original content"})).await;
         let read_tool = Arc::new(crate::ReadFileTool::new(
-            thread.downgrade(),
             project.clone(),
-            action_log,
-        ));
-        let edit_tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            languages,
+            action_log.clone(),
+            true,
         ));
 
         // Read the file first
@@ -4035,7 +3280,7 @@ mod tests {
         // First edit should work
         let edit_result = cx
             .update(|cx| {
-                edit_tool.clone().run(
+                tool.clone().run(
                     ToolInput::resolved(StreamingEditFileToolInput {
                         display_description: "First edit".into(),
                         path: "root/test.txt".into(),
@@ -4060,7 +3305,7 @@ mod tests {
         // Second edit should also work because the edit updated the recorded read time
         let edit_result = cx
             .update(|cx| {
-                edit_tool.clone().run(
+                tool.clone().run(
                     ToolInput::resolved(StreamingEditFileToolInput {
                         display_description: "Second edit".into(),
                         path: "root/test.txt".into(),
@@ -4084,43 +3329,13 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_streaming_external_modification_detected(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "test.txt": "original content"
-            }),
-        )
-        .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model.clone()),
-                cx,
-            )
-        });
-        let languages = project.read_with(cx, |project, _| project.languages().clone());
-        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
-
+    async fn test_streaming_external_modification_matching_edit_succeeds(cx: &mut TestAppContext) {
+        let (tool, project, action_log, fs, _thread) =
+            setup_test(cx, json!({"test.txt": "original content"})).await;
         let read_tool = Arc::new(crate::ReadFileTool::new(
-            thread.downgrade(),
             project.clone(),
-            action_log,
-        ));
-        let edit_tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            languages,
+            action_log.clone(),
+            true,
         ));
 
         // Read the file first
@@ -4166,10 +3381,9 @@ mod tests {
 
         cx.executor().run_until_parked();
 
-        // Try to edit - should fail because file was modified externally
         let result = cx
             .update(|cx| {
-                edit_tool.clone().run(
+                tool.clone().run(
                     ToolInput::resolved(StreamingEditFileToolInput {
                         display_description: "Edit after external change".into(),
                         path: "root/test.txt".into(),
@@ -4184,56 +3398,122 @@ mod tests {
                     cx,
                 )
             })
+            .await
+            .unwrap();
+
+        let StreamingEditFileToolOutput::Success {
+            new_text,
+            input_path,
+            ..
+        } = result
+        else {
+            panic!("expected success");
+        };
+
+        assert_eq!(new_text, "new content");
+        assert_eq!(input_path, PathBuf::from("root/test.txt"));
+    }
+
+    #[gpui::test]
+    async fn test_streaming_external_modification_mentioned_when_match_fails(
+        cx: &mut TestAppContext,
+    ) {
+        let (tool, project, action_log, fs, _thread) =
+            setup_test(cx, json!({"test.txt": "original content"})).await;
+        let read_tool = Arc::new(crate::ReadFileTool::new(
+            project.clone(),
+            action_log.clone(),
+            true,
+        ));
+
+        cx.update(|cx| {
+            read_tool.clone().run(
+                ToolInput::resolved(crate::ReadFileToolInput {
+                    path: "root/test.txt".to_string(),
+                    start_line: None,
+                    end_line: None,
+                }),
+                ToolCallEventStream::test().0,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(2));
+        fs.save(
+            path!("/root/test.txt").as_ref(),
+            &"externally modified content".into(),
+            language::LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+
+        let project_path = project
+            .read_with(cx, |project, cx| {
+                project.find_project_path("root/test.txt", cx)
+            })
+            .expect("Should find project path");
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(project_path, cx))
+            .await
+            .unwrap();
+        buffer
+            .update(cx, |buffer, cx| buffer.reload(cx))
+            .await
+            .unwrap();
+
+        cx.executor().run_until_parked();
+
+        let result = cx
+            .update(|cx| {
+                tool.clone().run(
+                    ToolInput::resolved(StreamingEditFileToolInput {
+                        display_description: "Edit after external change".into(),
+                        path: "root/test.txt".into(),
+                        mode: StreamingEditFileMode::Edit,
+                        content: None,
+                        edits: Some(vec![Edit {
+                            old_text: "original content".into(),
+                            new_text: "new content".into(),
+                        }]),
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
             .await;
 
-        let StreamingEditFileToolOutput::Error { error } = result.unwrap_err() else {
+        let StreamingEditFileToolOutput::Error {
+            error,
+            diff,
+            input_path,
+        } = result.unwrap_err()
+        else {
             panic!("expected error");
         };
+
         assert!(
-            error.contains("has been modified since you last read it"),
-            "Error should mention file modification, got: {}",
-            error
+            error.contains("Could not find matching text for edit at index 0"),
+            "Error should mention failed match, got: {error}"
         );
+        assert!(
+            error.contains("has changed on disk since you last read it"),
+            "Error should mention possible disk change, got: {error}"
+        );
+        assert!(diff.is_empty());
+        assert_eq!(input_path, Some(PathBuf::from("root/test.txt")));
     }
 
     #[gpui::test]
     async fn test_streaming_dirty_buffer_detected(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "test.txt": "original content"
-            }),
-        )
-        .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model.clone()),
-                cx,
-            )
-        });
-        let languages = project.read_with(cx, |project, _| project.languages().clone());
-        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
-
+        let (tool, project, action_log, _fs, _thread) =
+            setup_test(cx, json!({"test.txt": "original content"})).await;
         let read_tool = Arc::new(crate::ReadFileTool::new(
-            thread.downgrade(),
             project.clone(),
-            action_log,
-        ));
-        let edit_tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            languages,
+            action_log.clone(),
+            true,
         ));
 
         // Read the file first
@@ -4273,7 +3553,7 @@ mod tests {
         // Try to edit - should fail because buffer has unsaved changes
         let result = cx
             .update(|cx| {
-                edit_tool.clone().run(
+                tool.clone().run(
                     ToolInput::resolved(StreamingEditFileToolInput {
                         display_description: "Edit with dirty buffer".into(),
                         path: "root/test.txt".into(),
@@ -4290,7 +3570,12 @@ mod tests {
             })
             .await;
 
-        let StreamingEditFileToolOutput::Error { error } = result.unwrap_err() else {
+        let StreamingEditFileToolOutput::Error {
+            error,
+            diff,
+            input_path,
+        } = result.unwrap_err()
+        else {
             panic!("expected error");
         };
         assert!(
@@ -4308,50 +3593,21 @@ mod tests {
             "Error should ask user to manually save or revert when tools aren't available, got: {}",
             error
         );
+        assert!(diff.is_empty());
+        assert!(input_path.is_none());
     }
 
     #[gpui::test]
     async fn test_streaming_overlapping_edits_resolved_sequentially(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
         // Edit 1's replacement introduces text that contains edit 2's
         // old_text as a substring. Because edits resolve sequentially
         // against the current buffer, edit 2 finds a unique match in
         // the modified buffer and succeeds.
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "aaa\nbbb\nccc\nddd\neee\n"
-            }),
-        )
-        .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "aaa\nbbb\nccc\nddd\neee\n"})).await;
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver) = ToolCallEventStream::test();
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Setup: resolve the buffer
         sender.send_partial(json!({
@@ -4379,7 +3635,7 @@ mod tests {
         cx.run_until_parked();
 
         // Send the final input with all three edits.
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Overlapping edits",
             "path": "root/file.txt",
             "mode": "edit",
@@ -4399,36 +3655,10 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_create_content_streamed(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree("/root", json!({"dir": {}})).await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (tool, project, _action_log, _fs, _thread) = setup_test(cx, json!({"dir": {}})).await;
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver) = ToolCallEventStream::test();
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Transition to BufferResolved
         sender.send_partial(json!({
@@ -4480,7 +3710,7 @@ mod tests {
         );
 
         // Send final input
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Create new file",
             "path": "root/dir/new_file.txt",
             "mode": "write",
@@ -4496,44 +3726,22 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_overwrite_diff_revealed_during_streaming(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "old line 1\nold line 2\nold line 3\n"
-            }),
+        let (tool, _project, _action_log, _fs, _thread) = setup_test(
+            cx,
+            json!({"file.txt": "old line 1\nold line 2\nold line 3\n"}),
         )
         .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, mut receiver) = ToolCallEventStream::test();
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Transition to BufferResolved
+        sender.send_partial(json!({
+            "display_description": "Overwrite file",
+            "path": "root/file.txt",
+        }));
+        cx.run_until_parked();
+
         sender.send_partial(json!({
             "display_description": "Overwrite file",
             "path": "root/file.txt",
@@ -4566,7 +3774,7 @@ mod tests {
         });
 
         // Send final input
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Overwrite file",
             "path": "root/file.txt",
             "mode": "write",
@@ -4589,42 +3797,14 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_overwrite_content_streamed(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "old line 1\nold line 2\nold line 3\n"
-            }),
+        let (tool, project, _action_log, _fs, _thread) = setup_test(
+            cx,
+            json!({"file.txt": "old line 1\nold line 2\nold line 3\n"}),
         )
         .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver) = ToolCallEventStream::test();
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         // Transition to BufferResolved
         sender.send_partial(json!({
@@ -4637,8 +3817,9 @@ mod tests {
         // Verify buffer still has old content (no content partial yet)
         let buffer = project.update(cx, |project, cx| {
             let path = project.find_project_path("root/file.txt", cx).unwrap();
-            project.get_open_buffer(&path, cx).unwrap()
+            project.open_buffer(path, cx)
         });
+        let buffer = buffer.await.unwrap();
         assert_eq!(
             buffer.read_with(cx, |b, _| b.text()),
             "old line 1\nold line 2\nold line 3\n"
@@ -4668,7 +3849,7 @@ mod tests {
         );
 
         // Send final input with complete content
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Overwrite file",
             "path": "root/file.txt",
             "mode": "write",
@@ -4688,42 +3869,11 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_edit_json_fixer_escape_corruption(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            json!({
-                "file.txt": "hello\nworld\nfoo\n"
-            }),
-        )
-        .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let model = Arc::new(FakeLanguageModel::default());
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                Some(model),
-                cx,
-            )
-        });
-
-        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "hello\nworld\nfoo\n"})).await;
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
         let (event_stream, _receiver) = ToolCallEventStream::test();
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
-
-        let task = cx.update(|cx| tool.run(input, event_stream, cx));
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
 
         sender.send_partial(json!({
             "display_description": "Edit",
@@ -4755,7 +3905,7 @@ mod tests {
         cx.run_until_parked();
 
         // Send final.
-        sender.send_final(json!({
+        sender.send_full(json!({
             "display_description": "Edit",
             "path": "root/file.txt",
             "mode": "edit",
@@ -4769,51 +3919,50 @@ mod tests {
         assert_eq!(new_text, "HELLO\nWORLD\nfoo\n");
     }
 
+    #[gpui::test]
+    async fn test_streaming_final_input_stringified_edits_succeeds(cx: &mut TestAppContext) {
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "hello\nworld\n"})).await;
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (event_stream, _receiver) = ToolCallEventStream::test();
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
+
+        sender.send_partial(json!({
+            "display_description": "Edit",
+            "path": "root/file.txt",
+            "mode": "edit"
+        }));
+        cx.run_until_parked();
+
+        sender.send_full(json!({
+            "display_description": "Edit",
+            "path": "root/file.txt",
+            "mode": "edit",
+            "edits": "[{\"old_text\": \"hello\\nworld\", \"new_text\": \"HELLO\\nWORLD\"}]"
+        }));
+
+        let result = task.await;
+        let StreamingEditFileToolOutput::Success { new_text, .. } = result.unwrap() else {
+            panic!("expected success");
+        };
+        assert_eq!(new_text, "HELLO\nWORLD\n");
+    }
+
     // Verifies that after streaming_edit_file_tool edits a file, the action log
     // reports changed buffers so that the Accept All / Reject All review UI appears.
     #[gpui::test]
     async fn test_streaming_edit_file_tool_registers_changed_buffers(cx: &mut TestAppContext) {
-        init_test(cx);
+        let (tool, _project, action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "line 1\nline 2\nline 3\n"})).await;
         cx.update(|cx| {
             let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
             settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
             agent_settings::AgentSettings::override_global(settings, cx);
         });
 
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                "file.txt": "line 1\nline 2\nline 3\n"
-            }),
-        )
-        .await;
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                None,
-                cx,
-            )
-        });
-        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
         let (event_stream, _rx) = ToolCallEventStream::test();
-
         let task = cx.update(|cx| {
-            tool.run(
+            tool.clone().run(
                 ToolInput::resolved(StreamingEditFileToolInput {
                     display_description: "Edit lines".to_string(),
                     path: "root/file.txt".into(),
@@ -4837,8 +3986,8 @@ mod tests {
         let changed = action_log.read_with(cx, |log, cx| log.changed_buffers(cx));
         assert!(
             !changed.is_empty(),
-            "action_log.changed_buffers() should be non-empty after streaming edit, \
-             but no changed buffers were found \u{2014} Accept All / Reject All will not appear"
+            "action_log.changed_buffers() should be non-empty after streaming edit,
+             but no changed buffers were found - Accept All / Reject All will not appear"
         );
     }
 
@@ -4847,47 +3996,17 @@ mod tests {
     async fn test_streaming_edit_file_tool_write_mode_registers_changed_buffers(
         cx: &mut TestAppContext,
     ) {
-        init_test(cx);
+        let (tool, _project, action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "original content"})).await;
         cx.update(|cx| {
             let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
             settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
             agent_settings::AgentSettings::override_global(settings, cx);
         });
 
-        let fs = project::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                "file.txt": "original content"
-            }),
-        )
-        .await;
-
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
-        let context_server_registry =
-            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-        let thread = cx.new(|cx| {
-            crate::Thread::new(
-                project.clone(),
-                cx.new(|_cx| ProjectContext::default()),
-                context_server_registry,
-                Templates::new(),
-                None,
-                cx,
-            )
-        });
-        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
-
-        let tool = Arc::new(StreamingEditFileTool::new(
-            project.clone(),
-            thread.downgrade(),
-            language_registry,
-        ));
         let (event_stream, _rx) = ToolCallEventStream::test();
-
         let task = cx.update(|cx| {
-            tool.run(
+            tool.clone().run(
                 ToolInput::resolved(StreamingEditFileToolInput {
                     display_description: "Overwrite file".to_string(),
                     path: "root/file.txt".into(),
@@ -4911,6 +4030,366 @@ mod tests {
             "action_log.changed_buffers() should be non-empty after streaming write, \
              but no changed buffers were found \u{2014} Accept All / Reject All will not appear"
         );
+    }
+
+    #[gpui::test]
+    async fn test_streaming_edit_file_tool_fields_out_of_order_in_write_mode(
+        cx: &mut TestAppContext,
+    ) {
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "old_content"})).await;
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (event_stream, _receiver) = ToolCallEventStream::test();
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
+
+        sender.send_partial(json!({
+            "display_description": "Overwrite file",
+            "mode": "write"
+        }));
+        cx.run_until_parked();
+
+        sender.send_partial(json!({
+            "display_description": "Overwrite file",
+            "mode": "write",
+            "content": "new_content"
+        }));
+        cx.run_until_parked();
+
+        sender.send_partial(json!({
+            "display_description": "Overwrite file",
+            "mode": "write",
+            "content": "new_content",
+            "path": "root"
+        }));
+        cx.run_until_parked();
+
+        // Send final.
+        sender.send_full(json!({
+            "display_description": "Overwrite file",
+            "mode": "write",
+            "content": "new_content",
+            "path": "root/file.txt"
+        }));
+
+        let result = task.await;
+        let StreamingEditFileToolOutput::Success { new_text, .. } = result.unwrap() else {
+            panic!("expected success");
+        };
+        assert_eq!(new_text, "new_content");
+    }
+
+    #[gpui::test]
+    async fn test_streaming_edit_file_tool_fields_out_of_order_in_edit_mode(
+        cx: &mut TestAppContext,
+    ) {
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "old_content"})).await;
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (event_stream, _receiver) = ToolCallEventStream::test();
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
+
+        sender.send_partial(json!({
+            "display_description": "Overwrite file",
+            "mode": "edit"
+        }));
+        cx.run_until_parked();
+
+        sender.send_partial(json!({
+            "display_description": "Overwrite file",
+            "mode": "edit",
+            "edits": [{"old_text": "old_content"}]
+        }));
+        cx.run_until_parked();
+
+        sender.send_partial(json!({
+            "display_description": "Overwrite file",
+            "mode": "edit",
+            "edits": [{"old_text": "old_content", "new_text": "new_content"}]
+        }));
+        cx.run_until_parked();
+
+        sender.send_partial(json!({
+            "display_description": "Overwrite file",
+            "mode": "edit",
+            "edits": [{"old_text": "old_content", "new_text": "new_content"}],
+            "path": "root"
+        }));
+        cx.run_until_parked();
+
+        // Send final.
+        sender.send_full(json!({
+            "display_description": "Overwrite file",
+            "mode": "edit",
+            "edits": [{"old_text": "old_content", "new_text": "new_content"}],
+            "path": "root/file.txt"
+        }));
+        cx.run_until_parked();
+
+        let result = task.await;
+        let StreamingEditFileToolOutput::Success { new_text, .. } = result.unwrap() else {
+            panic!("expected success");
+        };
+        assert_eq!(new_text, "new_content");
+    }
+
+    #[gpui::test]
+    async fn test_streaming_edit_partial_last_line(cx: &mut TestAppContext) {
+        let file_content = indoc::indoc! {r#"
+            fn on_query_change(&mut self, cx: &mut Context<Self>) {
+                self.filter(cx);
+            }
+
+
+
+            fn render_search(&self, cx: &mut Context<Self>) -> Div {
+                div()
+            }
+        "#}
+        .to_string();
+
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.rs": file_content})).await;
+
+        // The model sends old_text with a PARTIAL last line.
+        let old_text = "}\n\n\n\nfn render_search";
+        let new_text = "}\n\nfn render_search";
+
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (event_stream, _receiver) = ToolCallEventStream::test();
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
+
+        sender.send_full(json!({
+            "display_description": "Remove extra blank lines",
+            "path": "root/file.rs",
+            "mode": "edit",
+            "edits": [{"old_text": old_text, "new_text": new_text}]
+        }));
+
+        let result = task.await;
+        let StreamingEditFileToolOutput::Success {
+            new_text: final_text,
+            ..
+        } = result.unwrap()
+        else {
+            panic!("expected success");
+        };
+
+        // The edit should reduce 3 blank lines to 1 blank line before
+        // fn render_search, without duplicating the function signature.
+        let expected = file_content.replace("}\n\n\n\nfn render_search", "}\n\nfn render_search");
+        pretty_assertions::assert_eq!(
+            final_text,
+            expected,
+            "Edit should only remove blank lines before render_search"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_streaming_edit_preserves_blank_line_after_trailing_newline_replacement(
+        cx: &mut TestAppContext,
+    ) {
+        let file_content = "before\ntarget\n\nafter\n";
+        let old_text = "target\n";
+        let new_text = "one\ntwo\ntarget\n";
+        let expected = "before\none\ntwo\ntarget\n\nafter\n";
+
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.rs": file_content})).await;
+        let (mut sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (event_stream, _receiver) = ToolCallEventStream::test();
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
+
+        sender.send_full(json!({
+            "display_description": "description",
+            "path": "root/file.rs",
+            "mode": "edit",
+            "edits": [{"old_text": old_text, "new_text": new_text}]
+        }));
+
+        let result = task.await;
+
+        let StreamingEditFileToolOutput::Success {
+            new_text: final_text,
+            ..
+        } = result.unwrap()
+        else {
+            panic!("expected success");
+        };
+
+        pretty_assertions::assert_eq!(
+            final_text,
+            expected,
+            "Edit should preserve a single blank line before test_after"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_streaming_reject_created_file_deletes_it(cx: &mut TestAppContext) {
+        let (tool, _project, action_log, fs, _thread) = setup_test(cx, json!({"dir": {}})).await;
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        // Create a new file via the streaming edit file tool
+        let (event_stream, _rx) = ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                ToolInput::resolved(StreamingEditFileToolInput {
+                    display_description: "Create new file".into(),
+                    path: "root/dir/new_file.txt".into(),
+                    mode: StreamingEditFileMode::Write,
+                    content: Some("Hello, World!".into()),
+                    edits: None,
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        let result = task.await;
+        assert!(result.is_ok(), "create should succeed: {:?}", result.err());
+        cx.run_until_parked();
+
+        assert!(
+            fs.is_file(path!("/root/dir/new_file.txt").as_ref()).await,
+            "file should exist after creation"
+        );
+
+        // Reject all edits — this should delete the newly created file
+        let changed = action_log.read_with(cx, |log, cx| log.changed_buffers(cx));
+        assert!(
+            !changed.is_empty(),
+            "action_log should track the created file as changed"
+        );
+
+        action_log
+            .update(cx, |log, cx| log.reject_all_edits(None, cx))
+            .await;
+        cx.run_until_parked();
+
+        assert!(
+            !fs.is_file(path!("/root/dir/new_file.txt").as_ref()).await,
+            "file should be deleted after rejecting creation, but an empty file was left behind"
+        );
+    }
+
+    #[test]
+    fn test_input_deserializes_double_encoded_fields() {
+        let input = serde_json::from_value::<StreamingEditFileToolInput>(json!({
+            "display_description": "Edit",
+            "path": "root/file.txt",
+            "mode": "\"edit\"",
+            "edits": "[{\"old_text\": \"hello\\nworld\", \"new_text\": \"HELLO\\nWORLD\"}]"
+        }))
+        .expect("input should deserialize");
+
+        assert!(matches!(input.mode, StreamingEditFileMode::Edit));
+        let edits = input.edits.expect("edits should deserialize");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].old_text, "hello\nworld");
+        assert_eq!(edits[0].new_text, "HELLO\nWORLD");
+
+        let input = serde_json::from_value::<StreamingEditFileToolInput>(json!({
+            "display_description": "Edit",
+            "path": "root/file.txt",
+            "mode": "\"edit\""
+        }))
+        .expect("input should deserialize");
+        assert!(input.edits.is_none());
+
+        let input = serde_json::from_value::<StreamingEditFileToolInput>(json!({
+            "display_description": "Edit",
+            "path": "root/file.txt",
+            "mode": "\"edit\"",
+            "edits": null
+        }))
+        .expect("input should deserialize");
+        assert!(input.edits.is_none());
+
+        let input = serde_json::from_value::<StreamingEditFileToolPartialInput>(json!({
+            "display_description": "Edit",
+            "path": "root/file.txt",
+            "mode": "\"edit\"",
+            "edits": "[{\"old_text\": \"hello\\nworld\", \"new_text\": \"HELLO\\nWORLD\"}]"
+        }))
+        .expect("input should deserialize");
+
+        assert!(matches!(input.mode, Some(StreamingEditFileMode::Edit)));
+        let edits = input.edits.expect("edits should deserialize");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].old_text.as_deref(), Some("hello\nworld"));
+        assert_eq!(edits[0].new_text.as_deref(), Some("HELLO\nWORLD"));
+
+        let input = serde_json::from_value::<StreamingEditFileToolPartialInput>(json!({
+            "display_description": "Edit",
+            "path": "root/file.txt"
+        }))
+        .expect("input should deserialize");
+        assert!(input.mode.is_none());
+        assert!(input.edits.is_none());
+
+        let input = serde_json::from_value::<StreamingEditFileToolPartialInput>(json!({
+            "display_description": "Edit",
+            "path": "root/file.txt",
+            "mode": null,
+            "edits": null
+        }))
+        .expect("input should deserialize");
+        assert!(input.mode.is_none());
+        assert!(input.edits.is_none());
+    }
+
+    async fn setup_test_with_fs(
+        cx: &mut TestAppContext,
+        fs: Arc<project::FakeFs>,
+        worktree_paths: &[&std::path::Path],
+    ) -> (
+        Arc<StreamingEditFileTool>,
+        Entity<Project>,
+        Entity<ActionLog>,
+        Arc<project::FakeFs>,
+        Entity<Thread>,
+    ) {
+        let project = Project::test(fs.clone(), worktree_paths.iter().copied(), cx).await;
+        let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
+        let context_server_registry =
+            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
+        let model = Arc::new(FakeLanguageModel::default());
+        let thread = cx.new(|cx| {
+            crate::Thread::new(
+                project.clone(),
+                cx.new(|_cx| ProjectContext::default()),
+                context_server_registry,
+                Templates::new(),
+                Some(model),
+                cx,
+            )
+        });
+        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
+        let tool = Arc::new(StreamingEditFileTool::new(
+            project.clone(),
+            thread.downgrade(),
+            action_log.clone(),
+            language_registry,
+        ));
+        (tool, project, action_log, fs, thread)
+    }
+
+    async fn setup_test(
+        cx: &mut TestAppContext,
+        initial_tree: serde_json::Value,
+    ) -> (
+        Arc<StreamingEditFileTool>,
+        Entity<Project>,
+        Entity<ActionLog>,
+        Arc<project::FakeFs>,
+        Entity<Thread>,
+    ) {
+        init_test(cx);
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", initial_tree).await;
+        setup_test_with_fs(cx, fs, &[path!("/root").as_ref()]).await
     }
 
     fn init_test(cx: &mut TestAppContext) {
